@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 maritime_reach_map.png
 subic_darwin_map.png
+output/
