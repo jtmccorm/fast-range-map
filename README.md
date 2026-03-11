@@ -2,6 +2,32 @@
 
 `maritime_reach_map.py` generates a single static PNG visualizing maritime operational reach from one or more hubs while treating land as an impassable barrier.
 
+## Setup
+
+The repo already includes the Natural Earth land dataset under `data/ne_10m_land/`, so a fresh workstation only needs Python and the packages in `requirements.txt`.
+
+Recommended clean install:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 maritime_reach_map.py
+```
+
+Alternative install matching the local setup used during development:
+
+```bash
+pip install --target .vendor -r requirements.txt
+python3 maritime_reach_map.py
+```
+
+Notes:
+
+- The script automatically adds `.vendor/` to `sys.path` if that folder exists.
+- The script also sets a local Matplotlib config/cache directory under `.mplconfig/`, so no extra GUI or desktop setup is required.
+- Verified locally with Homebrew `python3` on macOS and the package set in `requirements.txt`.
+
 ## Usage
 
 Run the default example from the prompt:
