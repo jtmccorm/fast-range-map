@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import itertools
 import math
 import os
@@ -31,6 +32,7 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch, PathPatch
 from matplotlib.path import Path as MplPath
 from matplotlib.ticker import FuncFormatter, MultipleLocator
+from PIL import Image, ImageDraw
 from shapely import STRtree
 from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon, box, shape
 from shapely.geometry.base import BaseGeometry
@@ -40,6 +42,16 @@ NM_TO_KM = 1.852
 EARTH_RADIUS_KM = 6371.0088
 DEFAULT_BBOX = (70.0, 170.0, -20.0, 40.0)
 DEFAULT_LAND_SHP = REPO_ROOT / "data" / "ne_10m_land" / "ne_10m_land.shp"
+NEIGHBOR_DELTAS = (
+    (-1, 0),
+    (1, 0),
+    (0, -1),
+    (0, 1),
+    (-1, -1),
+    (-1, 1),
+    (1, -1),
+    (1, 1),
+)
 
 
 @dataclass(frozen=True)
@@ -59,6 +71,43 @@ class TracedHub:
     @property
     def label(self) -> str:
         return f"Hub {self.index}"
+
+
+@dataclass(frozen=True)
+class NavigationGrid:
+    min_lon: float
+    max_lon: float
+    min_lat: float
+    max_lat: float
+    lon_step_deg: float
+    lat_step_deg: float
+    lon_centers: np.ndarray
+    lat_centers: np.ndarray
+    land_mask: np.ndarray
+    water_mask: np.ndarray
+    ns_cost_km: float
+    ew_cost_km: np.ndarray
+    diag_up_cost_km: np.ndarray
+    diag_down_cost_km: np.ndarray
+    min_edge_cost_km: float
+
+    @property
+    def rows(self) -> int:
+        return int(self.lat_centers.size)
+
+    @property
+    def cols(self) -> int:
+        return int(self.lon_centers.size)
+
+    def cell_center(self, row: int, col: int) -> HubLocation:
+        return HubLocation(lat=float(self.lat_centers[row]), lon=float(self.lon_centers[col]))
+
+    def coord_to_cell(self, lat: float, lon: float) -> tuple[int, int]:
+        row = int(math.floor((lat - self.min_lat) / self.lat_step_deg))
+        col = int(math.floor((lon - self.min_lon) / self.lon_step_deg))
+        row = max(0, min(self.rows - 1, row))
+        col = max(0, min(self.cols - 1, col))
+        return row, col
 
 
 class LandDetector:
@@ -101,13 +150,13 @@ def parse_args() -> argparse.Namespace:
         "--rays",
         type=int,
         default=360,
-        help="Number of rays per hub. Default: 360.",
+        help="Deprecated and ignored. Retained only for backward compatibility.",
     )
     parser.add_argument(
         "--step-km",
         type=float,
         default=8.0,
-        help="Ray marching step size in kilometers. Default: 8.",
+        help="Routing grid resolution in kilometers. Default: 8.",
     )
     parser.add_argument(
         "--land-shapefile",
@@ -149,8 +198,36 @@ def destination_point(
     return math.degrees(lat2), normalize_longitude(math.degrees(lon2))
 
 
+def great_circle_distance_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = lat2_rad - lat1_rad
+    delta_lon = math.radians(lon2 - lon1)
+    sin_half_lat = math.sin(delta_lat / 2.0)
+    sin_half_lon = math.sin(delta_lon / 2.0)
+    a = (
+        sin_half_lat * sin_half_lat
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * sin_half_lon * sin_half_lon
+    )
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    return EARTH_RADIUS_KM * c
+
+
+def expand_bbox(
+    bbox: tuple[float, float, float, float], range_nm: float
+) -> tuple[float, float, float, float]:
+    min_lon, max_lon, min_lat, max_lat = bbox
+    margin_deg = max(6.0, range_nm / 60.0 + 2.0)
+    return (
+        max(-179.9, min_lon - margin_deg),
+        min(179.9, max_lon + margin_deg),
+        max(-89.9, min_lat - margin_deg),
+        min(89.9, max_lat + margin_deg),
+    )
+
+
 def load_land_polygons(
-    shapefile_path: Path, bbox: tuple[float, float, float, float], range_nm: float
+    shapefile_path: Path, search_bbox: tuple[float, float, float, float]
 ) -> LandDetector:
     if not shapefile_path.exists():
         raise FileNotFoundError(
@@ -158,15 +235,7 @@ def load_land_polygons(
             "Expected Natural Earth land polygons in data/ne_10m_land/."
         )
 
-    min_lon, max_lon, min_lat, max_lat = bbox
-    search_margin_deg = max(6.0, range_nm / 60.0 + 2.0)
-    search_region = box(
-        min_lon - search_margin_deg,
-        min_lat - search_margin_deg,
-        max_lon + search_margin_deg,
-        max_lat + search_margin_deg,
-    )
-
+    search_region = box(search_bbox[0], search_bbox[2], search_bbox[1], search_bbox[3])
     polygons: list[Polygon] = []
     reader = shapefile.Reader(str(shapefile_path))
     for shp in reader.iterShapes():
@@ -175,126 +244,285 @@ def load_land_polygons(
             continue
         clipped = geom.intersection(search_region)
         for polygon in iter_polygons(clipped):
-            if polygon.is_empty:
-                continue
-            polygons.append(polygon)
+            if not polygon.is_empty:
+                polygons.append(polygon)
 
     if not polygons:
         raise RuntimeError("No land polygons intersect the requested region.")
     return LandDetector(polygons)
 
 
-def snap_hub_to_water(
-    hub: HubLocation,
+def build_navigation_grid(
     detector: LandDetector,
-    max_search_km: float = 35.0,
-    radius_step_km: float = 2.0,
-    bearing_step_deg: float = 10.0,
-    clearance_km: float = 20.0,
-    clearance_bearing_step_deg: float = 15.0,
-    preferred_open_bearings: int = 18,
-) -> HubLocation:
-    def open_bearing_score(candidate: HubLocation) -> int:
-        score = 0
-        for bearing in np.arange(0.0, 360.0, clearance_bearing_step_deg):
-            lat, lon = destination_point(candidate.lat, candidate.lon, float(bearing), clearance_km)
-            if not detector.is_land(lon, lat):
-                score += 1
-        return score
+    routing_bbox: tuple[float, float, float, float],
+    step_km: float,
+) -> NavigationGrid:
+    min_lon, max_lon, min_lat, max_lat = routing_bbox
+    mid_lat = (min_lat + max_lat) / 2.0
+    lat_step_deg = step_km / 111.32
+    lon_scale = max(0.2, math.cos(math.radians(mid_lat)))
+    lon_step_deg = step_km / (111.32 * lon_scale)
 
-    best_candidate: HubLocation | None = None
-    best_rank: tuple[int, float] | None = None
+    rows = max(2, int(math.ceil((max_lat - min_lat) / lat_step_deg)))
+    cols = max(2, int(math.ceil((max_lon - min_lon) / lon_step_deg)))
+    grid_max_lat = min_lat + rows * lat_step_deg
+    grid_max_lon = min_lon + cols * lon_step_deg
 
-    if not detector.is_land(hub.lon, hub.lat):
-        initial_score = open_bearing_score(hub)
-        if initial_score >= preferred_open_bearings:
-            return hub
-        best_candidate = hub
-        best_rank = (initial_score, 0.0)
+    lat_centers = min_lat + (np.arange(rows, dtype=float) + 0.5) * lat_step_deg
+    lon_centers = min_lon + (np.arange(cols, dtype=float) + 0.5) * lon_step_deg
 
-    radii = np.arange(radius_step_km, max_search_km + radius_step_km, radius_step_km)
-    for radius_km in radii:
-        for bearing in np.arange(0.0, 360.0, bearing_step_deg):
-            lat, lon = destination_point(hub.lat, hub.lon, float(bearing), float(radius_km))
-            if detector.is_land(lon, lat):
-                continue
-            candidate = HubLocation(lat=lat, lon=lon)
-            rank = (open_bearing_score(candidate), -float(radius_km))
-            if best_rank is None or rank > best_rank:
-                best_rank = rank
-                best_candidate = candidate
+    image = Image.new("L", (cols, rows), 0)
+    draw = ImageDraw.Draw(image)
 
-    if best_candidate is None:
-        raise RuntimeError(
-            f"Unable to find nearby water for hub at ({hub.lat:.3f}, {hub.lon:.3f})."
+    def lon_to_x(lon: float) -> float:
+        return (lon - min_lon) / lon_step_deg
+
+    def lat_to_y(lat: float) -> float:
+        return (grid_max_lat - lat) / lat_step_deg
+
+    for polygon in detector.polygons:
+        exterior = [(lon_to_x(lon), lat_to_y(lat)) for lon, lat in polygon.exterior.coords]
+        if len(exterior) >= 3:
+            draw.polygon(exterior, fill=255)
+        for interior in polygon.interiors:
+            hole = [(lon_to_x(lon), lat_to_y(lat)) for lon, lat in interior.coords]
+            if len(hole) >= 3:
+                draw.polygon(hole, fill=0)
+
+    land_mask = np.flipud(np.array(image, dtype=np.uint8) > 0)
+    water_mask = ~land_mask
+
+    ns_cost_km = great_circle_distance_km(lat_centers[0], lon_centers[0], lat_centers[1], lon_centers[0])
+    ew_cost_km = np.array(
+        [
+            great_circle_distance_km(lat, lon_centers[0], lat, lon_centers[0] + lon_step_deg)
+            for lat in lat_centers
+        ],
+        dtype=float,
+    )
+    diag_up_cost_km = np.full(rows, np.inf, dtype=float)
+    diag_down_cost_km = np.full(rows, np.inf, dtype=float)
+    for row in range(1, rows):
+        diag_up_cost_km[row] = great_circle_distance_km(
+            lat_centers[row], lon_centers[0], lat_centers[row - 1], lon_centers[0] + lon_step_deg
         )
-    return best_candidate
+    for row in range(rows - 1):
+        diag_down_cost_km[row] = great_circle_distance_km(
+            lat_centers[row], lon_centers[0], lat_centers[row + 1], lon_centers[0] + lon_step_deg
+        )
+
+    min_edge_cost_km = min(
+        float(ns_cost_km),
+        float(ew_cost_km.min()),
+        float(diag_up_cost_km[1:].min()),
+        float(diag_down_cost_km[:-1].min()),
+    )
+
+    return NavigationGrid(
+        min_lon=min_lon,
+        max_lon=grid_max_lon,
+        min_lat=min_lat,
+        max_lat=grid_max_lat,
+        lon_step_deg=lon_step_deg,
+        lat_step_deg=lat_step_deg,
+        lon_centers=lon_centers,
+        lat_centers=lat_centers,
+        land_mask=land_mask,
+        water_mask=water_mask,
+        ns_cost_km=float(ns_cost_km),
+        ew_cost_km=ew_cost_km,
+        diag_up_cost_km=diag_up_cost_km,
+        diag_down_cost_km=diag_down_cost_km,
+        min_edge_cost_km=float(min_edge_cost_km),
+    )
 
 
-def trace_ray(
-    origin: HubLocation,
-    bearing_deg: float,
-    max_distance_km: float,
-    step_km: float,
-    detector: LandDetector,
-) -> tuple[float, float]:
-    last_water = (origin.lon, origin.lat)
-    for distance_km in np.arange(step_km, max_distance_km + step_km, step_km):
-        lat, lon = destination_point(origin.lat, origin.lon, bearing_deg, float(distance_km))
-        if detector.is_land(lon, lat):
+def snap_hub_to_water(
+    hub: HubLocation, detector: LandDetector, grid: NavigationGrid
+) -> tuple[HubLocation, tuple[int, int]]:
+    row, col = grid.coord_to_cell(hub.lat, hub.lon)
+    if grid.water_mask[row, col] and not detector.is_land(hub.lon, hub.lat):
+        return hub, (row, col)
+
+    snapped_row, snapped_col = find_nearest_water_cell(grid, row, col)
+    return grid.cell_center(snapped_row, snapped_col), (snapped_row, snapped_col)
+
+
+def find_nearest_water_cell(
+    grid: NavigationGrid, start_row: int, start_col: int
+) -> tuple[int, int]:
+    if grid.water_mask[start_row, start_col]:
+        return start_row, start_col
+
+    for radius in range(1, max(grid.rows, grid.cols)):
+        best_cell: tuple[int, int] | None = None
+        best_distance = math.inf
+        row_min = max(0, start_row - radius)
+        row_max = min(grid.rows - 1, start_row + radius)
+        col_min = max(0, start_col - radius)
+        col_max = min(grid.cols - 1, start_col + radius)
+
+        for row in range(row_min, row_max + 1):
+            for col in range(col_min, col_max + 1):
+                if max(abs(row - start_row), abs(col - start_col)) != radius:
+                    continue
+                if not grid.water_mask[row, col]:
+                    continue
+                candidate_distance = (row - start_row) ** 2 + (col - start_col) ** 2
+                if candidate_distance < best_distance:
+                    best_distance = candidate_distance
+                    best_cell = (row, col)
+
+        if best_cell is not None:
+            return best_cell
+
+    raise RuntimeError("Unable to locate any water cell in the navigation grid.")
+
+
+def compute_cost_distance(
+    grid: NavigationGrid, start_cell: tuple[int, int], max_distance_km: float
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    start_row, start_col = start_cell
+    radius_cells = int(math.ceil(max_distance_km / grid.min_edge_cost_km)) + 4
+    row_start = max(0, start_row - radius_cells)
+    row_end = min(grid.rows, start_row + radius_cells + 1)
+    col_start = max(0, start_col - radius_cells)
+    col_end = min(grid.cols, start_col + radius_cells + 1)
+
+    water_mask = grid.water_mask[row_start:row_end, col_start:col_end]
+    distances = np.full(water_mask.shape, np.inf, dtype=np.float32)
+    visited = np.zeros(water_mask.shape, dtype=bool)
+
+    local_start = (start_row - row_start, start_col - col_start)
+    if not water_mask[local_start]:
+        raise RuntimeError("Routing origin is not on a water cell.")
+
+    heap: list[tuple[float, int, int]] = [(0.0, local_start[0], local_start[1])]
+    distances[local_start] = 0.0
+
+    while heap:
+        current_distance, row, col = heapq.heappop(heap)
+        if current_distance > max_distance_km:
             break
-        last_water = (lon, lat)
-    return last_water
+        if visited[row, col]:
+            continue
+        visited[row, col] = True
+        global_row = row_start + row
+
+        for delta_row, delta_col in NEIGHBOR_DELTAS:
+            next_row = row + delta_row
+            next_col = col + delta_col
+            if (
+                next_row < 0
+                or next_row >= water_mask.shape[0]
+                or next_col < 0
+                or next_col >= water_mask.shape[1]
+                or not water_mask[next_row, next_col]
+            ):
+                continue
+
+            if delta_row != 0 and delta_col != 0:
+                if not water_mask[row + delta_row, col] or not water_mask[row, col + delta_col]:
+                    continue
+
+            step_cost = movement_cost_km(grid, global_row, delta_row, delta_col)
+            proposed_distance = current_distance + step_cost
+            if proposed_distance >= distances[next_row, next_col] or proposed_distance > max_distance_km:
+                continue
+
+            distances[next_row, next_col] = proposed_distance
+            heapq.heappush(heap, (proposed_distance, next_row, next_col))
+
+    return distances, (row_start, row_end, col_start, col_end)
 
 
-def trace_reach(
-    origin: HubLocation,
-    range_km: float,
-    rays: int,
-    step_km: float,
-    detector: LandDetector,
-) -> list[tuple[float, float]]:
-    bearings = np.linspace(0.0, 360.0, rays, endpoint=False)
-    return [
-        trace_ray(origin, float(bearing), range_km, step_km, detector)
-        for bearing in bearings
-    ]
+def movement_cost_km(
+    grid: NavigationGrid, row: int, delta_row: int, delta_col: int
+) -> float:
+    if delta_row == 0:
+        return float(grid.ew_cost_km[row])
+    if delta_col == 0:
+        return grid.ns_cost_km
+    if delta_row < 0:
+        return float(grid.diag_up_cost_km[row])
+    return float(grid.diag_down_cost_km[row])
 
 
 def build_reach_polygon(
-    ray_endpoints: Sequence[tuple[float, float]],
+    distances: np.ndarray,
+    threshold_km: float,
+    grid: NavigationGrid,
+    bounds: tuple[int, int, int, int],
     land_union: BaseGeometry,
     trace_origin: HubLocation,
     bbox: tuple[float, float, float, float],
 ) -> BaseGeometry:
-    anchor = (trace_origin.lon, trace_origin.lat)
-    sectors: list[BaseGeometry] = []
-    wrapped_endpoints = list(ray_endpoints)
-    if len(wrapped_endpoints) < 2:
+    if not np.isfinite(distances).any():
         return GeometryCollection()
 
-    for left, right in zip(wrapped_endpoints, wrapped_endpoints[1:] + wrapped_endpoints[:1]):
-        triangle = Polygon([anchor, left, right])
-        if triangle.is_empty or triangle.area == 0.0:
-            continue
-        if not triangle.is_valid:
-            triangle = triangle.buffer(0)
-        if not triangle.is_empty:
-            sectors.append(triangle)
+    row_start, row_end, col_start, col_end = bounds
+    lon_centers = grid.lon_centers[col_start:col_end]
+    lat_centers = grid.lat_centers[row_start:row_end]
 
-    if not sectors:
-        return GeometryCollection()
+    raw_geometry = distance_field_to_geometry(
+        distances, threshold_km, lon_centers, lat_centers, grid.lon_step_deg, grid.lat_step_deg
+    )
+    if raw_geometry.is_empty:
+        return raw_geometry
+    if not raw_geometry.is_valid:
+        raw_geometry = raw_geometry.buffer(0)
 
-    raw_reach = unary_union(sectors)
-    if not raw_reach.is_valid:
-        raw_reach = raw_reach.buffer(0)
+    cleaned = raw_geometry.difference(land_union)
+    if not cleaned.is_valid:
+        cleaned = cleaned.buffer(0)
 
-    water_only = raw_reach.difference(land_union)
-    connected = keep_component_for_anchor(water_only, Point(trace_origin.lon, trace_origin.lat))
+    simplify_tolerance = max(grid.lon_step_deg, grid.lat_step_deg) * 0.45
+    if simplify_tolerance > 0.0 and not cleaned.is_empty:
+        cleaned = cleaned.simplify(simplify_tolerance, preserve_topology=True)
+        cleaned = cleaned.difference(land_union)
+        if not cleaned.is_valid:
+            cleaned = cleaned.buffer(0)
+
+    connected = keep_component_for_anchor(cleaned, Point(trace_origin.lon, trace_origin.lat))
     clipped = connected.intersection(box(bbox[0], bbox[2], bbox[1], bbox[3]))
     if not clipped.is_valid:
         clipped = clipped.buffer(0)
     return clipped
+
+
+def distance_field_to_geometry(
+    distances: np.ndarray,
+    threshold_km: float,
+    lon_centers: np.ndarray,
+    lat_centers: np.ndarray,
+    lon_step_deg: float,
+    lat_step_deg: float,
+) -> BaseGeometry:
+    clipped_distances = np.where(np.isfinite(distances), distances, np.nan)
+    padded_distances = np.pad(clipped_distances, 1, constant_values=np.nan)
+    padded_lon = np.concatenate(
+        ([lon_centers[0] - lon_step_deg], lon_centers, [lon_centers[-1] + lon_step_deg])
+    )
+    padded_lat = np.concatenate(
+        ([lat_centers[0] - lat_step_deg], lat_centers, [lat_centers[-1] + lat_step_deg])
+    )
+
+    figure, axis = plt.subplots()
+    contour = axis.contourf(padded_lon, padded_lat, padded_distances, levels=[0.0, threshold_km])
+    polygons: list[BaseGeometry] = []
+    for path in contour.get_paths():
+        for ring in path.to_polygons():
+            polygon = Polygon(ring)
+            if not polygon.is_empty and polygon.area > 0.0:
+                polygons.append(polygon)
+    plt.close(figure)
+
+    if not polygons:
+        return GeometryCollection()
+    geometry = unary_union(polygons)
+    if not geometry.is_valid:
+        geometry = geometry.buffer(0)
+    return geometry
 
 
 def keep_component_for_anchor(geometry: BaseGeometry, anchor: Point) -> BaseGeometry:
@@ -302,6 +530,7 @@ def keep_component_for_anchor(geometry: BaseGeometry, anchor: Point) -> BaseGeom
         return geometry
     if isinstance(geometry, Polygon):
         return geometry
+
     polygons = list(iter_polygons(geometry))
     if not polygons:
         return GeometryCollection()
@@ -474,10 +703,7 @@ def render_map(
         offset_lat = 0.9 if hub.original.lat <= (min_lat + max_lat) / 2.0 else -0.9
         horizontal_alignment = "left" if offset_lon > 0 else "right"
         vertical_alignment = "bottom" if offset_lat > 0 else "top"
-        label = (
-            f"{hub.label}\n"
-            f"({hub.original.lat:.2f}, {hub.original.lon:.2f})"
-        )
+        label = f"{hub.label}\n({hub.original.lat:.2f}, {hub.original.lon:.2f})"
         text = ax.text(
             hub.original.lon + offset_lon,
             hub.original.lat + offset_lat,
@@ -539,7 +765,7 @@ def render_map(
     fig.text(
         0.013,
         0.012,
-        "Land mask: Natural Earth 1:10m land polygons | Water-constrained ray tracing",
+        "Land mask: Natural Earth 1:10m land polygons | Water-routed cost-distance model",
         fontsize=8.5,
         color="#4a5568",
     )
@@ -550,24 +776,25 @@ def render_map(
 def build_traced_hubs(
     hubs: Sequence[HubLocation],
     range_nm: float,
-    rays: int,
     step_km: float,
     bbox: tuple[float, float, float, float],
     detector: LandDetector,
+    grid: NavigationGrid,
 ) -> list[TracedHub]:
     traced_hubs: list[TracedHub] = []
     round_trip_km = range_nm * NM_TO_KM / 2.0
     one_way_km = range_nm * NM_TO_KM
 
     for index, hub in enumerate(hubs, start=1):
-        trace_origin = snap_hub_to_water(hub, detector)
-        round_trip_points = trace_reach(trace_origin, round_trip_km, rays, step_km, detector)
-        one_way_points = trace_reach(trace_origin, one_way_km, rays, step_km, detector)
+        trace_origin, start_cell = snap_hub_to_water(hub, detector, grid)
+        distances, bounds = compute_cost_distance(grid, start_cell, one_way_km)
 
         round_trip_polygon = build_reach_polygon(
-            round_trip_points, detector.union, trace_origin, bbox
+            distances, round_trip_km, grid, bounds, detector.union, trace_origin, bbox
         )
-        one_way_polygon = build_reach_polygon(one_way_points, detector.union, trace_origin, bbox)
+        one_way_polygon = build_reach_polygon(
+            distances, one_way_km, grid, bounds, detector.union, trace_origin, bbox
+        )
 
         traced_hubs.append(
             TracedHub(
@@ -594,14 +821,16 @@ def main() -> None:
     args = parse_args()
     hubs = parse_hubs(args.hub)
     bbox = tuple(float(value) for value in args.bbox)
-    detector = load_land_polygons(args.land_shapefile, bbox, args.range_nm)
+    routing_bbox = expand_bbox(bbox, args.range_nm)
+    detector = load_land_polygons(args.land_shapefile, routing_bbox)
+    grid = build_navigation_grid(detector, routing_bbox, args.step_km)
     traced_hubs = build_traced_hubs(
         hubs=hubs,
         range_nm=args.range_nm,
-        rays=args.rays,
         step_km=args.step_km,
         bbox=bbox,
         detector=detector,
+        grid=grid,
     )
     render_map(
         traced_hubs=traced_hubs,

@@ -23,5 +23,8 @@ python3 maritime_reach_map.py \
 ## Notes
 
 - The script uses bundled Natural Earth 1:10m land polygons in `data/ne_10m_land/`.
-- Hubs are rendered at the exact input coordinates. If a hub falls on land or too close to a coastline for ray tracing, the tracing origin is shifted slightly offshore while keeping the visible marker at the original hub location.
+- Reach is computed with a water-routed cost-distance grid, so paths can bend around coastlines and islands instead of stopping at first landfall.
+- Hubs are rendered at the exact input coordinates. If a hub falls in a land cell, the internal routing origin is snapped to the nearest water cell while keeping the visible marker at the original hub location.
+- `--step-km` controls the routing-grid resolution. Smaller values improve channel fidelity but increase runtime.
+- `--rays` is deprecated and ignored; it remains accepted only for backward compatibility with earlier versions.
 - Default map bounds are `70E to 170E` and `20S to 40N`.
