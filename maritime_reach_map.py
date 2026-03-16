@@ -40,11 +40,27 @@ from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon, b
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
+try:
+    from scipy.ndimage import gaussian_filter as scipy_gaussian_filter
+except ImportError:
+    scipy_gaussian_filter = None
+
 NM_TO_KM = 1.852
 EARTH_RADIUS_KM = 6371.0088
 DEFAULT_BBOX = (70.0, 170.0, -20.0, 40.0)
 DEFAULT_LAND_SHP = REPO_ROOT / "data" / "ne_10m_land" / "ne_10m_land.shp"
 CACHE_DIR = REPO_ROOT / "cache"
+THROUGHPUT_COLORMAPS = ("viridis", "cividis", "plasma", "inferno")
+DEFAULT_THROUGHPUT_COLORMAP = "viridis"
+DEFAULT_HEATMAP_ALPHA = 0.65
+DEFAULT_COLOR_PERCENTILE = 97.0
+DEFAULT_HEATMAP_SIGMA = 1.0
+LAND_COLOR = "#cbb89d"
+COASTLINE_COLOR = "#3a3a3a"
+OCEAN_COLOR = "#d8e3ea"
+GRID_COLOR = "#ffffff"
+SPINE_COLOR = "#718096"
+TICK_COLOR = "#334155"
 NEIGHBOR_DELTAS = (
     (-1, 0),
     (1, 0),
@@ -255,6 +271,30 @@ def parse_args() -> argparse.Namespace:
             "Minimum delivery cycle time per vessel in days for throughput mode. "
             "Caps each vessel at payload_tons / min_cycle_days tons/day. Default: 1.0."
         ),
+    )
+    parser.add_argument(
+        "--colormap",
+        choices=THROUGHPUT_COLORMAPS,
+        default=DEFAULT_THROUGHPUT_COLORMAP,
+        help="Sequential colormap for throughput mode. Default: viridis.",
+    )
+    parser.add_argument(
+        "--heatmap-alpha",
+        type=float,
+        default=DEFAULT_HEATMAP_ALPHA,
+        help="Opacity for the throughput heatmap overlay. Default: 0.65.",
+    )
+    parser.add_argument(
+        "--color-percentile",
+        type=float,
+        default=DEFAULT_COLOR_PERCENTILE,
+        help="Percentile cap used for throughput heatmap color scaling. Default: 97.",
+    )
+    parser.add_argument(
+        "--heatmap-sigma",
+        type=float,
+        default=DEFAULT_HEATMAP_SIGMA,
+        help="Gaussian smoothing sigma for throughput visualization only. Set to 0 to disable. Default: 1.0.",
     )
     return parser.parse_args()
 
@@ -854,9 +894,9 @@ def add_land_layer(ax: plt.Axes, land_union: BaseGeometry, bbox: tuple[float, fl
     add_geometry(
         ax,
         land_in_view,
-        facecolor="#efe7d8",
-        edgecolor="#49423f",
-        linewidth=0.55,
+        facecolor=LAND_COLOR,
+        edgecolor=COASTLINE_COLOR,
+        linewidth=1.0,
         alpha=1.0,
         zorder=zorder,
     )
@@ -909,11 +949,16 @@ def style_map_axes(
     ax.yaxis.set_major_locator(MultipleLocator(10))
     ax.xaxis.set_major_formatter(FuncFormatter(format_lon))
     ax.yaxis.set_major_formatter(FuncFormatter(format_lat))
-    ax.grid(color="white", linewidth=0.8, linestyle="--", alpha=0.85)
+    ax.set_axisbelow(True)
+    ax.grid(color=GRID_COLOR, linewidth=0.7, linestyle="--", alpha=0.42)
     ax.set_aspect(1.0 / math.cos(math.radians(mid_lat)))
-    ax.set_title(f"{title}\n{subtitle}", fontsize=18, fontweight="bold", pad=14)
+    ax.set_title(f"{title}\n{subtitle}", fontsize=16, fontweight="bold", pad=14)
     ax.set_xlabel("Longitude", fontsize=11)
     ax.set_ylabel("Latitude", fontsize=11)
+    ax.tick_params(colors=TICK_COLOR)
+    for spine in ax.spines.values():
+        spine.set_color(SPINE_COLOR)
+        spine.set_linewidth(0.9)
 
 
 def compute_throughput_field(
@@ -959,17 +1004,78 @@ def compute_throughput_field(
     return throughput
 
 
+def gaussian_filter_array(values: np.ndarray, sigma: float) -> np.ndarray:
+    if sigma <= 0.0:
+        return values
+    if scipy_gaussian_filter is not None:
+        return scipy_gaussian_filter(values, sigma=sigma, mode="nearest")
+
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float32)
+    kernel = np.exp(-(offsets * offsets) / (2.0 * sigma * sigma))
+    kernel /= kernel.sum()
+
+    def convolve_along_axis(array: np.ndarray, axis: int) -> np.ndarray:
+        pad_width = [(0, 0)] * array.ndim
+        pad_width[axis] = (radius, radius)
+        padded = np.pad(array, pad_width, mode="edge")
+        return np.apply_along_axis(lambda line: np.convolve(line, kernel, mode="valid"), axis, padded)
+
+    return convolve_along_axis(convolve_along_axis(values, 0), 1)
+
+
+def build_throughput_visualization_field(
+    throughput_field: np.ndarray,
+    grid: NavigationGrid,
+    *,
+    sigma: float,
+) -> np.ndarray:
+    masked_throughput = np.where(grid.water_mask, throughput_field, np.nan).astype(np.float32, copy=False)
+    if sigma <= 0.0:
+        return masked_throughput
+
+    filled_values = np.nan_to_num(masked_throughput, nan=0.0).astype(np.float32, copy=False)
+    water_weights = grid.water_mask.astype(np.float32, copy=False)
+    smoothed_values = gaussian_filter_array(filled_values, sigma)
+    smoothed_weights = gaussian_filter_array(water_weights, sigma)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        smoothed = smoothed_values / smoothed_weights
+
+    smoothed[smoothed_weights <= 1e-6] = np.nan
+    smoothed[~grid.water_mask] = np.nan
+    np.clip(smoothed, 0.0, None, out=smoothed)
+    return smoothed.astype(np.float32, copy=False)
+
+
+def compute_heatmap_vmax(
+    throughput_field: np.ndarray,
+    grid: NavigationGrid,
+    percentile: float,
+) -> float:
+    visible_positive = throughput_field[
+        np.isfinite(throughput_field) & grid.water_mask & (throughput_field > 0.0)
+    ]
+    if visible_positive.size == 0:
+        return 1.0
+    percentile_value = float(np.percentile(visible_positive, percentile))
+    minimum_positive = float(visible_positive.min())
+    return max(percentile_value, minimum_positive, 1.0)
+
+
 def plot_throughput_heatmap(
     ax: plt.Axes,
     throughput_field: np.ndarray,
     grid: NavigationGrid,
     *,
+    cmap_name: str,
+    alpha: float,
     vmax: float | None = None,
 ):
     positive_mask = np.isfinite(throughput_field) & grid.water_mask & (throughput_field > 0.0)
     display_field = np.ma.masked_where(~positive_mask, throughput_field)
     maximum_value = float(vmax) if vmax is not None else float(display_field.max()) if display_field.count() else 1.0
-    heatmap_cmap = plt.get_cmap("YlOrRd").copy()
+    heatmap_cmap = plt.get_cmap(cmap_name).copy()
     heatmap_cmap.set_bad(alpha=0.0)
     return ax.imshow(
         display_field,
@@ -979,7 +1085,7 @@ def plot_throughput_heatmap(
         interpolation="nearest",
         vmin=0.0,
         vmax=max(maximum_value, 1.0),
-        alpha=0.86,
+        alpha=alpha,
         zorder=2,
     )
 
@@ -990,7 +1096,10 @@ def plot_throughput_contours(
     grid: NavigationGrid,
     contour_levels: Sequence[float] = (50.0, 100.0, 250.0, 500.0),
 ):
-    contour_field = np.ma.masked_where(~grid.water_mask | (throughput_field <= 0.0), throughput_field)
+    contour_field = np.ma.masked_where(
+        ~grid.water_mask | ~np.isfinite(throughput_field) | (throughput_field <= 0.0),
+        throughput_field,
+    )
     if contour_field.count() == 0:
         return None
 
@@ -1004,17 +1113,14 @@ def plot_throughput_contours(
         grid.lat_centers,
         contour_field,
         levels=levels,
-        colors="#3d2d1f",
-        linewidths=0.95,
-        alpha=0.92,
+        colors="black",
+        linewidths=0.8,
+        alpha=0.7,
         zorder=5,
     )
-    for collection in getattr(contours, "collections", ()):
-        collection.set_path_effects([path_effects.withStroke(linewidth=2.0, foreground="white")])
-
-    labels = ax.clabel(contours, fmt=lambda value: f"{value:,.0f}", inline=True, fontsize=8, colors="#2a1b12")
+    labels = ax.clabel(contours, fmt=lambda value: f"{value:,.0f}", inline=True, fontsize=8)
     for text in labels:
-        text.set_path_effects([path_effects.withStroke(linewidth=1.3, foreground="white")])
+        text.set_path_effects([path_effects.withStroke(linewidth=1.2, foreground="white")])
     return contours
 
 
@@ -1033,7 +1139,8 @@ def render_map(
 
     fig, ax = plt.subplots(figsize=(16, 10), dpi=180)
     fig.patch.set_facecolor("white")
-    ax.set_facecolor("#d8eef7")
+    fig.subplots_adjust(left=0.06, right=0.90, top=0.88, bottom=0.11)
+    ax.set_facecolor(OCEAN_COLOR)
 
     add_land_layer(ax, land_union, bbox, zorder=1)
 
@@ -1122,20 +1229,31 @@ def render_throughput_map(
     output_path: Path,
     d_min_nm: float,
     min_cycle_days: float,
+    colormap: str,
+    heatmap_alpha: float,
+    color_percentile: float,
+    heatmap_sigma: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(16, 10), dpi=180)
     fig.patch.set_facecolor("white")
-    ax.set_facecolor("#d8eef7")
+    fig.subplots_adjust(left=0.06, right=0.90, top=0.88, bottom=0.11)
+    ax.set_facecolor(OCEAN_COLOR)
 
-    visible_positive = throughput_field[np.isfinite(throughput_field) & grid.water_mask & (throughput_field > 0.0)]
-    heatmap = plot_throughput_heatmap(
-        ax,
+    visualization_field = build_throughput_visualization_field(
         throughput_field,
         grid,
-        vmax=float(visible_positive.max()) if visible_positive.size else 1.0,
+        sigma=heatmap_sigma,
+    )
+    heatmap = plot_throughput_heatmap(
+        ax,
+        visualization_field,
+        grid,
+        cmap_name=colormap,
+        alpha=heatmap_alpha,
+        vmax=compute_heatmap_vmax(visualization_field, grid, color_percentile),
     )
     add_land_layer(ax, land_union, bbox, zorder=3)
-    plot_throughput_contours(ax, throughput_field, grid, contour_levels)
+    plot_throughput_contours(ax, visualization_field, grid, contour_levels)
     add_hub_markers(ax, routed_hubs, bbox)
     style_map_axes(
         ax,
@@ -1144,9 +1262,12 @@ def render_throughput_map(
         subtitle="Sustainment capacity from vessel transport strength and navigable delivery distance",
     )
 
-    colorbar = fig.colorbar(heatmap, ax=ax, pad=0.02, shrink=0.9)
+    colorbar = fig.colorbar(heatmap, ax=ax, pad=0.02, shrink=0.86)
     colorbar.set_label("Throughput Capacity (tons/day)", fontsize=11)
     colorbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value:,.0f}"))
+    colorbar.ax.tick_params(labelsize=9, colors=TICK_COLOR)
+    colorbar.outline.set_edgecolor(SPINE_COLOR)
+    colorbar.outline.set_linewidth(0.8)
 
     fig.text(
         0.013,
@@ -1155,6 +1276,8 @@ def render_throughput_map(
             "Water-routed throughput model | "
             f"d_min = {d_min_nm:.1f} nm | "
             f"Min cycle = {min_cycle_days:.1f} day(s) | "
+            f"Color cap = P{color_percentile:.0f} | "
+            f"Sigma = {heatmap_sigma:.1f} | "
             "Vessel contribution cutoff at half of listed range"
         ),
         fontsize=8.5,
@@ -1307,6 +1430,12 @@ def main() -> None:
     args = parse_args()
     if args.min_cycle_days <= 0.0:
         raise ValueError("--min-cycle-days must be positive.")
+    if not 0.0 <= args.heatmap_alpha <= 1.0:
+        raise ValueError("--heatmap-alpha must be between 0 and 1.")
+    if not 0.0 < args.color_percentile <= 100.0:
+        raise ValueError("--color-percentile must be greater than 0 and at most 100.")
+    if args.heatmap_sigma < 0.0:
+        raise ValueError("--heatmap-sigma must be non-negative.")
     hubs = parse_hubs(args.hub, args.hub_vessel)
     bbox = tuple(float(value) for value in args.bbox)
     routing_range_nm = routing_range_nm_for_mode(hubs, args.output_mode, args.range_nm)
@@ -1355,6 +1484,10 @@ def main() -> None:
             output_path=args.output,
             d_min_nm=d_min_nm,
             min_cycle_days=args.min_cycle_days,
+            colormap=args.colormap,
+            heatmap_alpha=args.heatmap_alpha,
+            color_percentile=args.color_percentile,
+            heatmap_sigma=args.heatmap_sigma,
         )
         hubs_to_report = routed_hubs
 
