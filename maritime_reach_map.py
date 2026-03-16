@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import heapq
 import itertools
+import json
 import math
 import os
 import sys
@@ -42,6 +44,7 @@ NM_TO_KM = 1.852
 EARTH_RADIUS_KM = 6371.0088
 DEFAULT_BBOX = (70.0, 170.0, -20.0, 40.0)
 DEFAULT_LAND_SHP = REPO_ROOT / "data" / "ne_10m_land" / "ne_10m_land.shp"
+CACHE_DIR = REPO_ROOT / "cache"
 NEIGHBOR_DELTAS = (
     (-1, 0),
     (1, 0),
@@ -426,6 +429,80 @@ def compute_cost_distance(
             heapq.heappush(heap, (proposed_distance, next_row, next_col))
 
     return distances, (row_start, row_end, col_start, col_end)
+
+
+def cache_distance_field(
+    cache_path: Path, distances: np.ndarray, bounds: tuple[int, int, int, int]
+) -> None:
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(
+        cache_path,
+        {"distances": np.asarray(distances, dtype=np.float32), "bounds": np.asarray(bounds, dtype=np.int32)},
+        allow_pickle=True,
+    )
+
+
+def load_cached_distance_field(
+    cache_path: Path,
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    if not cache_path.exists():
+        return None
+
+    try:
+        payload = np.load(cache_path, allow_pickle=True).item()
+        distances = np.asarray(payload["distances"], dtype=np.float32)
+        bounds_array = np.asarray(payload["bounds"], dtype=np.int32)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+    if distances.ndim != 2 or bounds_array.shape != (4,):
+        return None
+
+    row_start, row_end, col_start, col_end = (int(value) for value in bounds_array)
+    if row_start < 0 or col_start < 0 or row_end <= row_start or col_end <= col_start:
+        return None
+    if distances.shape != (row_end - row_start, col_end - col_start):
+        return None
+
+    return distances, (row_start, row_end, col_start, col_end)
+
+
+def distance_cache_path(
+    hub_index: int,
+    hub: HubLocation,
+    trace_origin: HubLocation,
+    start_cell: tuple[int, int],
+    grid: NavigationGrid,
+    step_km: float,
+    max_distance_km: float,
+) -> Path:
+    cache_key = {
+        "hub_index": hub_index,
+        "hub_lat": round(hub.lat, 6),
+        "hub_lon": round(hub.lon, 6),
+        "trace_lat": round(trace_origin.lat, 6),
+        "trace_lon": round(trace_origin.lon, 6),
+        "start_cell": list(start_cell),
+        "step_km": round(step_km, 6),
+        "max_distance_km": round(max_distance_km, 6),
+        "grid": {
+            "rows": grid.rows,
+            "cols": grid.cols,
+            "min_lon": round(grid.min_lon, 6),
+            "max_lon": round(grid.max_lon, 6),
+            "min_lat": round(grid.min_lat, 6),
+            "max_lat": round(grid.max_lat, 6),
+        },
+    }
+    digest = hashlib.sha256(json.dumps(cache_key, sort_keys=True).encode("ascii")).hexdigest()[:12]
+    filename = (
+        f"hub{hub_index:02d}_"
+        f"step{step_km:.3f}_"
+        f"lat{hub.lat:.4f}_"
+        f"lon{hub.lon:.4f}_"
+        f"{digest}_distance.npy"
+    ).replace("-", "m")
+    return CACHE_DIR / filename
 
 
 def movement_cost_km(
@@ -856,7 +933,13 @@ def build_traced_hubs(
 
     for index, hub in enumerate(hubs, start=1):
         trace_origin, start_cell = snap_hub_to_water(hub, detector, grid)
-        distances, bounds = compute_cost_distance(grid, start_cell, one_way_km)
+        cache_path = distance_cache_path(index, hub, trace_origin, start_cell, grid, step_km, one_way_km)
+        cached_distance_field = load_cached_distance_field(cache_path)
+        if cached_distance_field is None:
+            distances, bounds = compute_cost_distance(grid, start_cell, one_way_km)
+            cache_distance_field(cache_path, distances, bounds)
+        else:
+            distances, bounds = cached_distance_field
 
         round_trip_polygon = build_reach_polygon(
             distances, round_trip_km, grid, bounds, detector.union, trace_origin, bbox
