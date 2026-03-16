@@ -247,6 +247,15 @@ def parse_args() -> argparse.Namespace:
         default=[50.0, 100.0, 250.0, 500.0],
         help="Contour levels for throughput mode in tons/day. Default: 50 100 250 500.",
     )
+    parser.add_argument(
+        "--min-cycle-days",
+        type=float,
+        default=1.0,
+        help=(
+            "Minimum delivery cycle time per vessel in days for throughput mode. "
+            "Caps each vessel at payload_tons / min_cycle_days tons/day. Default: 1.0."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -911,11 +920,14 @@ def compute_throughput_field(
     distance_fields: Sequence[CachedDistanceField],
     hubs: Sequence[HubLocation],
     d_min_nm: float | None = None,
+    min_cycle_days: float = 1.0,
 ) -> np.ndarray:
     if len(distance_fields) != len(hubs):
         raise ValueError("Distance fields and hubs must have matching lengths.")
     if not distance_fields:
         raise ValueError("At least one cached distance field is required.")
+    if min_cycle_days <= 0.0:
+        raise ValueError("min_cycle_days must be positive.")
 
     grid_shape = distance_fields[0].grid_shape
     if any(field.grid_shape != grid_shape for field in distance_fields):
@@ -940,9 +952,9 @@ def compute_throughput_field(
             reachable_mask = finite_mask & (distance_nm <= (vessel.range_nm / 2.0))
             if not reachable_mask.any():
                 continue
-            throughput_window[reachable_mask] += (
-                vessel.transport_strength / stabilized_distance_nm[reachable_mask]
-            ).astype(np.float32, copy=False)
+            raw_throughput = vessel.transport_strength / stabilized_distance_nm[reachable_mask]
+            capped_throughput = np.minimum(raw_throughput, vessel.payload_tons / min_cycle_days)
+            throughput_window[reachable_mask] += capped_throughput.astype(np.float32, copy=False)
 
     return throughput
 
@@ -1109,6 +1121,7 @@ def render_throughput_map(
     contour_levels: Sequence[float],
     output_path: Path,
     d_min_nm: float,
+    min_cycle_days: float,
 ) -> None:
     fig, ax = plt.subplots(figsize=(16, 10), dpi=180)
     fig.patch.set_facecolor("white")
@@ -1141,6 +1154,7 @@ def render_throughput_map(
         (
             "Water-routed throughput model | "
             f"d_min = {d_min_nm:.1f} nm | "
+            f"Min cycle = {min_cycle_days:.1f} day(s) | "
             "Vessel contribution cutoff at half of listed range"
         ),
         fontsize=8.5,
@@ -1291,6 +1305,8 @@ def routing_range_nm_for_mode(
 
 def main() -> None:
     args = parse_args()
+    if args.min_cycle_days <= 0.0:
+        raise ValueError("--min-cycle-days must be positive.")
     hubs = parse_hubs(args.hub, args.hub_vessel)
     bbox = tuple(float(value) for value in args.bbox)
     routing_range_nm = routing_range_nm_for_mode(hubs, args.output_mode, args.range_nm)
@@ -1327,6 +1343,7 @@ def main() -> None:
             [hub.distance_field for hub in routed_hubs],
             hubs,
             d_min_nm=d_min_nm,
+            min_cycle_days=args.min_cycle_days,
         )
         render_throughput_map(
             routed_hubs=routed_hubs,
@@ -1337,6 +1354,7 @@ def main() -> None:
             contour_levels=args.throughput_contours,
             output_path=args.output,
             d_min_nm=d_min_nm,
+            min_cycle_days=args.min_cycle_days,
         )
         hubs_to_report = routed_hubs
 
