@@ -1,0 +1,57 @@
+scenario:
+  title: "Maritime Reach Map"
+  subtitle: ""
+
+map:
+  grid_km: 8
+  projection: mercator
+  bounding_box:
+    west: 70
+    east: 170
+    south: -20
+    north: 40
+  land_shapefile: data/ne_10m_land/ne_10m_land.shp
+
+model:
+  range_nm: 2000
+  distance_cache: true
+  min_cycle_days: 1.0
+  routing:
+    algorithm: dijkstra
+    knight_moves: true
+
+visualization:
+  land_color: "#cbb89d"
+  coastline_color: "#3a3a3a"
+  ocean_color: "#d8e3ea"
+  grid_color: "#ffffff"
+  spine_color: "#718096"
+  tick_color: "#334155"
+  hub_marker_color: "#c1121f"
+  hub_edge_color: "#000000"
+  hub_label_color: "#1f2933"
+  hub_label_background_color: "#ffffff"
+  font_family: "DejaVu Sans"
+  show_hub_coordinates: true
+  figure_width: 16
+  figure_height: 10
+  dpi: 180
+  range_one_way_fill_color: "#f4a261"
+  range_one_way_edge_color: "#cf7c1d"
+  range_one_way_alpha: 0.30
+  range_round_trip_fill_color: "#4f83cc"
+  range_round_trip_edge_color: "#2c5ea8"
+  range_round_trip_alpha: 0.36
+  overlap_fill_color: "#7b2cbf"
+  overlap_edge_color: "#5a189a"
+  overlap_alpha: 0.42
+  throughput_colormap: viridis
+  throughput_heatmap_alpha: 0.65
+  throughput_color_percentile: 97
+  throughput_heatmap_sigma: 1.0
+  throughput_contour_color: "#000000"
+  throughput_contour_linewidth: 0.8
+
+output_defaults:
+  show_hubs: true
+  contour_levels: [50, 100, 250, 500]

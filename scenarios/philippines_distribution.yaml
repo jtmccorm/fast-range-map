@@ -1,0 +1,70 @@
+defaults: ../defaults.yaml
+
+scenario:
+  name: "philippines_distribution"
+  title: "Maritime Distribution Capacity"
+  subtitle: "Surface Connector Sustainment"
+
+map:
+  grid_km: 6
+  bounding_box:
+    west: 116
+    east: 128
+    south: 5
+    north: 22
+
+model:
+  min_cycle_days: 1.0
+
+vessels:
+  LCU:
+    payload_tons: 175
+    speed_knots: 25
+    range_nm: 3000
+  ARV:
+    payload_tons: 50
+    speed_knots: 35
+    range_nm: 1600
+
+hubs:
+  - id: subic
+    label: "Subic Bay"
+    lat: 14.82
+    lon: 120.28
+    vessels:
+      LCU: 4
+      ARV: 1
+  - id: cebu
+    label: "Cebu"
+    lat: 10.31
+    lon: 123.89
+    vessels:
+      LCU: 1
+      ARV: 3
+
+outputs:
+  - id: theater_throughput
+    type: throughput_field
+    title: "Theater Sustainment Capacity"
+    subtitle: "LCU + ARV Fleet"
+    bounding_box:
+      west: 70
+      east: 170
+      south: -20
+      north: 40
+    color_scheme: viridis
+    contour_levels: [100, 200, 300, 400, 500]
+    show_hubs: true
+    filename: output/throughput_field.png
+  - id: lcu_range
+    type: range_map
+    vessel: LCU
+    title: "LCU Operational Reach"
+    subtitle: "One-way and round-trip reach from configured LCU hubs"
+    bounding_box:
+      west: 70
+      east: 170
+      south: -20
+      north: 40
+    show_hubs: true
+    filename: output/lcu_range.png

@@ -40,6 +40,20 @@ from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon, b
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
 
+from scenario_config import (
+    BoundingBox,
+    HubDefinition,
+    MapConfig,
+    ModelConfig,
+    OutputConfig,
+    RoutingConfig,
+    ScenarioConfig,
+    ScenarioMetadata,
+    VesselDefinition,
+    VisualizationConfig,
+    load_config,
+)
+
 try:
     from scipy.ndimage import gaussian_filter as scipy_gaussian_filter
 except ImportError:
@@ -61,7 +75,7 @@ OCEAN_COLOR = "#d8e3ea"
 GRID_COLOR = "#ffffff"
 SPINE_COLOR = "#718096"
 TICK_COLOR = "#334155"
-NEIGHBOR_DELTAS = (
+BASE_NEIGHBOR_DELTAS = (
     (-1, 0),
     (1, 0),
     (0, -1),
@@ -70,6 +84,8 @@ NEIGHBOR_DELTAS = (
     (-1, 1),
     (1, -1),
     (1, 1),
+)
+KNIGHT_MOVE_DELTAS = (
     (-2, -1),
     (-2, 1),
     (-1, -2),
@@ -85,6 +101,8 @@ NEIGHBOR_DELTAS = (
 class HubLocation:
     lat: float
     lon: float
+    id: str | None = None
+    label: str | None = None
     vessels: tuple["VesselSpec", ...] = ()
 
     @property
@@ -101,6 +119,7 @@ class VesselSpec:
     payload_tons: float
     speed_knots: float
     range_nm: float
+    name: str | None = None
 
     @property
     def transport_strength(self) -> float:
@@ -132,6 +151,10 @@ class RoutedHub:
 
     @property
     def label(self) -> str:
+        if self.original.label:
+            return self.original.label
+        if self.original.id:
+            return self.original.id.replace("_", " ").title()
         return f"Hub {self.index}"
 
 
@@ -193,10 +216,20 @@ def parse_args() -> argparse.Namespace:
         description="Generate a static PNG map of maritime reach constrained by land."
     )
     parser.add_argument(
+        "--config",
+        type=Path,
+        help="Path to a YAML scenario configuration file. When provided, the YAML scenario drives all outputs.",
+    )
+    parser.add_argument(
+        "--defaults-config",
+        type=Path,
+        help="Optional override path for the YAML defaults file used with --config.",
+    )
+    parser.add_argument(
         "--output-mode",
         choices=("range", "throughput"),
         default="range",
-        help="Visualization mode. Use 'range' for the existing reach map or 'throughput' for tons/day capacity.",
+        help="Legacy CLI mode. Use 'range' for reach maps or 'throughput' for tons/day capacity.",
     )
     parser.add_argument(
         "--hub",
@@ -253,7 +286,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=REPO_ROOT / "output/maritime_reach_map.png",
-        help="Output PNG path. Default: maritime_reach_map.png.",
+        help="Legacy CLI output PNG path. Default: maritime_reach_map.png.",
     )
     parser.add_argument(
         "--throughput-contours",
@@ -506,7 +539,10 @@ def find_nearest_water_cell(
 
 
 def compute_cost_distance(
-    grid: NavigationGrid, start_cell: tuple[int, int], max_distance_km: float
+    grid: NavigationGrid,
+    start_cell: tuple[int, int],
+    max_distance_km: float,
+    neighbor_deltas: Sequence[tuple[int, int]],
 ) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     start_row, start_col = start_cell
     radius_cells = int(math.ceil(max_distance_km / grid.min_edge_cost_km)) + 4
@@ -534,7 +570,13 @@ def compute_cost_distance(
             continue
         visited[row, col] = True
         for next_row, next_col, step_cost in iter_navigable_neighbors(
-            grid, water_mask, row, col, row_start, col_start
+            grid,
+            water_mask,
+            row,
+            col,
+            row_start,
+            col_start,
+            neighbor_deltas,
         ):
             proposed_distance = current_distance + step_cost
             if proposed_distance >= distances[next_row, next_col] or proposed_distance > max_distance_km:
@@ -590,6 +632,8 @@ def distance_cache_path(
     grid: NavigationGrid,
     step_km: float,
     max_distance_km: float,
+    routing_algorithm: str,
+    knight_moves: bool,
 ) -> Path:
     cache_key = {
         "hub_index": hub_index,
@@ -600,6 +644,10 @@ def distance_cache_path(
         "start_cell": list(start_cell),
         "step_km": round(step_km, 6),
         "max_distance_km": round(max_distance_km, 6),
+        "routing": {
+            "algorithm": routing_algorithm,
+            "knight_moves": knight_moves,
+        },
         "grid": {
             "rows": grid.rows,
             "cols": grid.cols,
@@ -639,11 +687,12 @@ def iter_navigable_neighbors(
     col: int,
     row_offset: int,
     col_offset: int,
+    neighbor_deltas: Sequence[tuple[int, int]],
 ) -> Iterator[tuple[int, int, float]]:
     global_row = row_offset + row
     global_col = col_offset + col
 
-    for delta_row, delta_col in NEIGHBOR_DELTAS:
+    for delta_row, delta_col in neighbor_deltas:
         next_row = row + delta_row
         next_col = col + delta_col
         if (
@@ -707,6 +756,12 @@ def edge_cost_km(grid: NavigationGrid, row: int, col: int, delta_row: int, delta
         grid.lat_centers[row + delta_row],
         grid.lon_centers[col + delta_col],
     )
+
+
+def neighbor_deltas_for_knight_moves(knight_moves: bool) -> tuple[tuple[int, int], ...]:
+    if knight_moves:
+        return BASE_NEIGHBOR_DELTAS + KNIGHT_MOVE_DELTAS
+    return BASE_NEIGHBOR_DELTAS
 
 
 def build_reach_polygon(
@@ -888,29 +943,41 @@ def format_lon(value: float, _position: float) -> str:
     return f"{abs(value):.0f}°{suffix}"
 
 
-def add_land_layer(ax: plt.Axes, land_union: BaseGeometry, bbox: tuple[float, float, float, float], *, zorder: int) -> None:
+def add_land_layer(
+    ax: plt.Axes,
+    land_union: BaseGeometry,
+    bbox: tuple[float, float, float, float],
+    visualization: VisualizationConfig,
+    *,
+    zorder: int,
+) -> None:
     map_region = box(bbox[0], bbox[2], bbox[1], bbox[3])
     land_in_view = land_union.intersection(map_region)
     add_geometry(
         ax,
         land_in_view,
-        facecolor=LAND_COLOR,
-        edgecolor=COASTLINE_COLOR,
+        facecolor=visualization.land_color,
+        edgecolor=visualization.coastline_color,
         linewidth=1.0,
         alpha=1.0,
         zorder=zorder,
     )
 
 
-def add_hub_markers(ax: plt.Axes, hubs: Sequence[RoutedHub], bbox: tuple[float, float, float, float]) -> None:
+def add_hub_markers(
+    ax: plt.Axes,
+    hubs: Sequence[RoutedHub],
+    bbox: tuple[float, float, float, float],
+    visualization: VisualizationConfig,
+) -> None:
     min_lon, max_lon, min_lat, max_lat = bbox
     for hub in hubs:
         ax.scatter(
             hub.original.lon,
             hub.original.lat,
             s=72,
-            facecolor="#c1121f",
-            edgecolor="black",
+            facecolor=visualization.hub_marker_color,
+            edgecolor=visualization.hub_edge_color,
             linewidth=1.0,
             zorder=6,
         )
@@ -918,19 +985,44 @@ def add_hub_markers(ax: plt.Axes, hubs: Sequence[RoutedHub], bbox: tuple[float, 
         offset_lat = 0.9 if hub.original.lat <= (min_lat + max_lat) / 2.0 else -0.9
         horizontal_alignment = "left" if offset_lon > 0 else "right"
         vertical_alignment = "bottom" if offset_lat > 0 else "top"
-        label = f"{hub.label}\n({hub.original.lat:.2f}, {hub.original.lon:.2f})"
+        label = hub.label
+        if visualization.show_hub_coordinates:
+            label = f"{label}\n({hub.original.lat:.2f}, {hub.original.lon:.2f})"
         text = ax.text(
             hub.original.lon + offset_lon,
             hub.original.lat + offset_lat,
             label,
             fontsize=9,
-            color="#1f2933",
+            color=visualization.hub_label_color,
             ha=horizontal_alignment,
             va=vertical_alignment,
             zorder=7,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.86, "pad": 0.4},
+            bbox={
+                "facecolor": visualization.hub_label_background_color,
+                "edgecolor": "none",
+                "alpha": 0.86,
+                "pad": 0.4,
+            },
         )
-        text.set_path_effects([path_effects.withStroke(linewidth=1.2, foreground="white")])
+        text.set_path_effects(
+            [path_effects.withStroke(linewidth=1.2, foreground=visualization.hub_label_background_color)]
+        )
+
+
+def apply_projection_to_axes(
+    ax: plt.Axes,
+    bbox: tuple[float, float, float, float],
+    projection: str,
+) -> None:
+    _min_lon, _max_lon, min_lat, max_lat = bbox
+    mid_lat = (min_lat + max_lat) / 2.0
+    if projection == "mercator":
+        ax.set_aspect(1.0 / max(math.cos(math.radians(mid_lat)), 0.2))
+        return
+    if projection == "plate_carree":
+        ax.set_aspect("auto")
+        return
+    raise ValueError(f"Unsupported projection: {projection}")
 
 
 def style_map_axes(
@@ -939,9 +1031,10 @@ def style_map_axes(
     *,
     title: str,
     subtitle: str,
+    projection: str,
+    visualization: VisualizationConfig,
 ) -> None:
     min_lon, max_lon, min_lat, max_lat = bbox
-    mid_lat = (min_lat + max_lat) / 2.0
 
     ax.set_xlim(min_lon, max_lon)
     ax.set_ylim(min_lat, max_lat)
@@ -950,14 +1043,15 @@ def style_map_axes(
     ax.xaxis.set_major_formatter(FuncFormatter(format_lon))
     ax.yaxis.set_major_formatter(FuncFormatter(format_lat))
     ax.set_axisbelow(True)
-    ax.grid(color=GRID_COLOR, linewidth=0.7, linestyle="--", alpha=0.42)
-    ax.set_aspect(1.0 / math.cos(math.radians(mid_lat)))
-    ax.set_title(f"{title}\n{subtitle}", fontsize=16, fontweight="bold", pad=14)
+    ax.grid(color=visualization.grid_color, linewidth=0.7, linestyle="--", alpha=0.42)
+    apply_projection_to_axes(ax, bbox, projection)
+    title_text = title if not subtitle else f"{title}\n{subtitle}"
+    ax.set_title(title_text, fontsize=16, fontweight="bold", pad=14)
     ax.set_xlabel("Longitude", fontsize=11)
     ax.set_ylabel("Latitude", fontsize=11)
-    ax.tick_params(colors=TICK_COLOR)
+    ax.tick_params(colors=visualization.tick_color)
     for spine in ax.spines.values():
-        spine.set_color(SPINE_COLOR)
+        spine.set_color(visualization.spine_color)
         spine.set_linewidth(0.9)
 
 
@@ -1095,6 +1189,9 @@ def plot_throughput_contours(
     throughput_field: np.ndarray,
     grid: NavigationGrid,
     contour_levels: Sequence[float] = (50.0, 100.0, 250.0, 500.0),
+    *,
+    contour_color: str,
+    contour_linewidth: float,
 ):
     contour_field = np.ma.masked_where(
         ~grid.water_mask | ~np.isfinite(throughput_field) | (throughput_field <= 0.0),
@@ -1113,8 +1210,8 @@ def plot_throughput_contours(
         grid.lat_centers,
         contour_field,
         levels=levels,
-        colors="black",
-        linewidths=0.8,
+        colors=contour_color,
+        linewidths=contour_linewidth,
         alpha=0.7,
         zorder=5,
     )
@@ -1130,6 +1227,12 @@ def render_map(
     bbox: tuple[float, float, float, float],
     range_nm: float,
     output_path: Path,
+    *,
+    title: str,
+    subtitle: str,
+    projection: str,
+    visualization: VisualizationConfig,
+    show_hubs: bool,
 ) -> None:
     round_trip_overlap = compute_overlap([hub.round_trip_polygon for hub in traced_hubs])
     one_way_overlap = compute_overlap([hub.one_way_polygon for hub in traced_hubs])
@@ -1137,86 +1240,111 @@ def render_map(
         [geometry for geometry in (round_trip_overlap, one_way_overlap) if not geometry.is_empty]
     )
 
-    fig, ax = plt.subplots(figsize=(16, 10), dpi=180)
-    fig.patch.set_facecolor("white")
-    fig.subplots_adjust(left=0.06, right=0.90, top=0.88, bottom=0.11)
-    ax.set_facecolor(OCEAN_COLOR)
+    with matplotlib.rc_context({"font.family": visualization.font_family}):
+        fig, ax = plt.subplots(
+            figsize=(visualization.figure_width, visualization.figure_height),
+            dpi=visualization.dpi,
+        )
+        fig.patch.set_facecolor("white")
+        fig.subplots_adjust(left=0.06, right=0.90, top=0.88, bottom=0.11)
+        ax.set_facecolor(visualization.ocean_color)
 
-    add_land_layer(ax, land_union, bbox, zorder=1)
+        add_land_layer(ax, land_union, bbox, visualization, zorder=1)
 
-    for hub in traced_hubs:
+        for hub in traced_hubs:
+            add_geometry(
+                ax,
+                hub.one_way_polygon,
+                facecolor=visualization.range_one_way_fill_color,
+                edgecolor=visualization.range_one_way_edge_color,
+                linewidth=0.6,
+                alpha=visualization.range_one_way_alpha,
+                zorder=2,
+            )
+        for hub in traced_hubs:
+            add_geometry(
+                ax,
+                hub.round_trip_polygon,
+                facecolor=visualization.range_round_trip_fill_color,
+                edgecolor=visualization.range_round_trip_edge_color,
+                linewidth=0.7,
+                alpha=visualization.range_round_trip_alpha,
+                zorder=3,
+            )
         add_geometry(
             ax,
-            hub.one_way_polygon,
-            facecolor="#f4a261",
-            edgecolor="#cf7c1d",
-            linewidth=0.6,
-            alpha=0.30,
-            zorder=2,
+            combined_overlap,
+            facecolor=visualization.overlap_fill_color,
+            edgecolor=visualization.overlap_edge_color,
+            linewidth=0.8,
+            alpha=visualization.overlap_alpha,
+            zorder=4,
         )
-    for hub in traced_hubs:
-        add_geometry(
+
+        if show_hubs:
+            add_hub_markers(ax, traced_hubs, bbox, visualization)
+        style_map_axes(
             ax,
-            hub.round_trip_polygon,
-            facecolor="#4f83cc",
-            edgecolor="#2c5ea8",
-            linewidth=0.7,
-            alpha=0.36,
-            zorder=3,
+            bbox,
+            title=title,
+            subtitle=subtitle,
+            projection=projection,
+            visualization=visualization,
         )
-    add_geometry(
-        ax,
-        combined_overlap,
-        facecolor="#7b2cbf",
-        edgecolor="#5a189a",
-        linewidth=0.8,
-        alpha=0.42,
-        zorder=4,
-    )
 
-    add_hub_markers(ax, traced_hubs, bbox)
-    style_map_axes(
-        ax,
-        bbox,
-        title="Maritime Operational Reach in Southeast Asia",
-        subtitle=f"Round trip: {range_nm / 2:.0f} nm | One way: {range_nm:.0f} nm",
-    )
+        legend_items = [
+            Patch(
+                facecolor=visualization.range_round_trip_fill_color,
+                edgecolor=visualization.range_round_trip_edge_color,
+                alpha=visualization.range_round_trip_alpha,
+                label="Round Trip Range",
+            ),
+            Patch(
+                facecolor=visualization.range_one_way_fill_color,
+                edgecolor=visualization.range_one_way_edge_color,
+                alpha=visualization.range_one_way_alpha,
+                label="One Way Range",
+            ),
+            Patch(
+                facecolor=visualization.overlap_fill_color,
+                edgecolor=visualization.overlap_edge_color,
+                alpha=visualization.overlap_alpha,
+                label="Overlap Between Hubs",
+            ),
+        ]
+        if show_hubs:
+            legend_items.append(
+                Line2D(
+                    [0],
+                    [0],
+                    marker="o",
+                    color="w",
+                    markerfacecolor=visualization.hub_marker_color,
+                    markeredgecolor=visualization.hub_edge_color,
+                    markersize=9,
+                    label="Hub",
+                )
+            )
+        legend = ax.legend(
+            handles=legend_items,
+            loc="lower left",
+            frameon=True,
+            framealpha=0.95,
+            facecolor="white",
+            edgecolor="#a0aec0",
+            fontsize=10,
+        )
+        legend.get_frame().set_linewidth(0.8)
 
-    legend_items = [
-        Patch(facecolor="#4f83cc", edgecolor="#2c5ea8", alpha=0.36, label="Round Trip Range"),
-        Patch(facecolor="#f4a261", edgecolor="#cf7c1d", alpha=0.30, label="One Way Range"),
-        Patch(facecolor="#7b2cbf", edgecolor="#5a189a", alpha=0.42, label="Overlap Between Hubs"),
-        Line2D(
-            [0],
-            [0],
-            marker="o",
-            color="w",
-            markerfacecolor="#c1121f",
-            markeredgecolor="black",
-            markersize=9,
-            label="Hub",
-        ),
-    ]
-    legend = ax.legend(
-        handles=legend_items,
-        loc="lower left",
-        frameon=True,
-        framealpha=0.95,
-        facecolor="white",
-        edgecolor="#a0aec0",
-        fontsize=10,
-    )
-    legend.get_frame().set_linewidth(0.8)
-
-    fig.text(
-        0.013,
-        0.012,
-        "Land mask: Natural Earth 1:10m land polygons | Water-routed cost-distance model",
-        fontsize=8.5,
-        color="#4a5568",
-    )
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+        fig.text(
+            0.013,
+            0.012,
+            "Land mask: Natural Earth 1:10m land polygons | Water-routed cost-distance model",
+            fontsize=8.5,
+            color="#4a5568",
+        )
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
 
 
 def render_throughput_map(
@@ -1233,58 +1361,78 @@ def render_throughput_map(
     heatmap_alpha: float,
     color_percentile: float,
     heatmap_sigma: float,
+    *,
+    title: str,
+    subtitle: str,
+    projection: str,
+    visualization: VisualizationConfig,
+    show_hubs: bool,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(16, 10), dpi=180)
-    fig.patch.set_facecolor("white")
-    fig.subplots_adjust(left=0.06, right=0.90, top=0.88, bottom=0.11)
-    ax.set_facecolor(OCEAN_COLOR)
+    with matplotlib.rc_context({"font.family": visualization.font_family}):
+        fig, ax = plt.subplots(
+            figsize=(visualization.figure_width, visualization.figure_height),
+            dpi=visualization.dpi,
+        )
+        fig.patch.set_facecolor("white")
+        fig.subplots_adjust(left=0.06, right=0.90, top=0.88, bottom=0.11)
+        ax.set_facecolor(visualization.ocean_color)
 
-    visualization_field = build_throughput_visualization_field(
-        throughput_field,
-        grid,
-        sigma=heatmap_sigma,
-    )
-    heatmap = plot_throughput_heatmap(
-        ax,
-        visualization_field,
-        grid,
-        cmap_name=colormap,
-        alpha=heatmap_alpha,
-        vmax=compute_heatmap_vmax(visualization_field, grid, color_percentile),
-    )
-    add_land_layer(ax, land_union, bbox, zorder=3)
-    plot_throughput_contours(ax, visualization_field, grid, contour_levels)
-    add_hub_markers(ax, routed_hubs, bbox)
-    style_map_axes(
-        ax,
-        bbox,
-        title="Maritime Throughput Capacity in Southeast Asia",
-        subtitle="Sustainment capacity from vessel transport strength and navigable delivery distance",
-    )
+        visualization_field = build_throughput_visualization_field(
+            throughput_field,
+            grid,
+            sigma=heatmap_sigma,
+        )
+        heatmap = plot_throughput_heatmap(
+            ax,
+            visualization_field,
+            grid,
+            cmap_name=colormap,
+            alpha=heatmap_alpha,
+            vmax=compute_heatmap_vmax(visualization_field, grid, color_percentile),
+        )
+        add_land_layer(ax, land_union, bbox, visualization, zorder=3)
+        plot_throughput_contours(
+            ax,
+            visualization_field,
+            grid,
+            contour_levels,
+            contour_color=visualization.throughput_contour_color,
+            contour_linewidth=visualization.throughput_contour_linewidth,
+        )
+        if show_hubs:
+            add_hub_markers(ax, routed_hubs, bbox, visualization)
+        style_map_axes(
+            ax,
+            bbox,
+            title=title,
+            subtitle=subtitle,
+            projection=projection,
+            visualization=visualization,
+        )
 
-    colorbar = fig.colorbar(heatmap, ax=ax, pad=0.02, shrink=0.86)
-    colorbar.set_label("Throughput Capacity (tons/day)", fontsize=11)
-    colorbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value:,.0f}"))
-    colorbar.ax.tick_params(labelsize=9, colors=TICK_COLOR)
-    colorbar.outline.set_edgecolor(SPINE_COLOR)
-    colorbar.outline.set_linewidth(0.8)
+        colorbar = fig.colorbar(heatmap, ax=ax, pad=0.02, shrink=0.86)
+        colorbar.set_label("Throughput Capacity (tons/day)", fontsize=11)
+        colorbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value:,.0f}"))
+        colorbar.ax.tick_params(labelsize=9, colors=visualization.tick_color)
+        colorbar.outline.set_edgecolor(visualization.spine_color)
+        colorbar.outline.set_linewidth(0.8)
 
-    fig.text(
-        0.013,
-        0.012,
-        (
-            "Water-routed throughput model | "
-            f"d_min = {d_min_nm:.1f} nm | "
-            f"Min cycle = {min_cycle_days:.1f} day(s) | "
-            f"Color cap = P{color_percentile:.0f} | "
-            f"Sigma = {heatmap_sigma:.1f} | "
-            "Vessel contribution cutoff at half of listed range"
-        ),
-        fontsize=8.5,
-        color="#4a5568",
-    )
-    fig.savefig(output_path, bbox_inches="tight")
-    plt.close(fig)
+        fig.text(
+            0.013,
+            0.012,
+            (
+                "Water-routed throughput model | "
+                f"d_min = {d_min_nm:.1f} nm | "
+                f"Min cycle = {min_cycle_days:.1f} day(s) | "
+                f"Color cap = P{color_percentile:.0f} | "
+                f"Sigma = {heatmap_sigma:.1f} | "
+                "Vessel contribution cutoff at half of listed range"
+            ),
+            fontsize=8.5,
+            color="#4a5568",
+        )
+        fig.savefig(output_path, bbox_inches="tight")
+        plt.close(fig)
 
 
 def build_routed_hubs(
@@ -1293,17 +1441,38 @@ def build_routed_hubs(
     step_km: float,
     detector: LandDetector,
     grid: NavigationGrid,
+    *,
+    routing_algorithm: str,
+    knight_moves: bool,
+    use_distance_cache: bool,
 ) -> list[RoutedHub]:
     routed_hubs: list[RoutedHub] = []
     max_distance_km = routing_range_nm * NM_TO_KM
+    neighbor_deltas = neighbor_deltas_for_knight_moves(knight_moves)
 
     for index, hub in enumerate(hubs, start=1):
         trace_origin, start_cell = snap_hub_to_water(hub, detector, grid)
-        cache_path = distance_cache_path(index, hub, trace_origin, start_cell, grid, step_km, max_distance_km)
-        cached_distance_field = load_cached_distance_field(cache_path)
+        cache_path = distance_cache_path(
+            index,
+            hub,
+            trace_origin,
+            start_cell,
+            grid,
+            step_km,
+            max_distance_km,
+            routing_algorithm,
+            knight_moves,
+        )
+        cached_distance_field = load_cached_distance_field(cache_path) if use_distance_cache else None
         if cached_distance_field is None:
-            distances, bounds = compute_cost_distance(grid, start_cell, max_distance_km)
-            cache_distance_field(cache_path, distances, bounds)
+            distances, bounds = compute_cost_distance(
+                grid,
+                start_cell,
+                max_distance_km,
+                neighbor_deltas,
+            )
+            if use_distance_cache:
+                cache_distance_field(cache_path, distances, bounds)
         else:
             distances, bounds = cached_distance_field
 
@@ -1367,11 +1536,66 @@ def build_traced_hubs(
     return traced_hubs
 
 
-def parse_hub_vessels(
+def validate_legacy_args(args: argparse.Namespace) -> None:
+    if args.min_cycle_days <= 0.0:
+        raise ValueError("--min-cycle-days must be positive.")
+    if not 0.0 <= args.heatmap_alpha <= 1.0:
+        raise ValueError("--heatmap-alpha must be between 0 and 1.")
+    if not 0.0 < args.color_percentile <= 100.0:
+        raise ValueError("--color-percentile must be greater than 0 and at most 100.")
+    if args.heatmap_sigma < 0.0:
+        raise ValueError("--heatmap-sigma must be non-negative.")
+
+
+def default_visualization_config(
+    *,
+    throughput_colormap: str = DEFAULT_THROUGHPUT_COLORMAP,
+    throughput_heatmap_alpha: float = DEFAULT_HEATMAP_ALPHA,
+    throughput_color_percentile: float = DEFAULT_COLOR_PERCENTILE,
+    throughput_heatmap_sigma: float = DEFAULT_HEATMAP_SIGMA,
+) -> VisualizationConfig:
+    return VisualizationConfig(
+        land_color=LAND_COLOR,
+        coastline_color=COASTLINE_COLOR,
+        ocean_color=OCEAN_COLOR,
+        grid_color=GRID_COLOR,
+        spine_color=SPINE_COLOR,
+        tick_color=TICK_COLOR,
+        hub_marker_color="#c1121f",
+        hub_edge_color="#000000",
+        hub_label_color="#1f2933",
+        hub_label_background_color="#ffffff",
+        font_family="DejaVu Sans",
+        show_hub_coordinates=True,
+        figure_width=16.0,
+        figure_height=10.0,
+        dpi=180,
+        range_one_way_fill_color="#f4a261",
+        range_one_way_edge_color="#cf7c1d",
+        range_one_way_alpha=0.30,
+        range_round_trip_fill_color="#4f83cc",
+        range_round_trip_edge_color="#2c5ea8",
+        range_round_trip_alpha=0.36,
+        overlap_fill_color="#7b2cbf",
+        overlap_edge_color="#5a189a",
+        overlap_alpha=0.42,
+        throughput_colormap=throughput_colormap,
+        throughput_heatmap_alpha=throughput_heatmap_alpha,
+        throughput_color_percentile=throughput_color_percentile,
+        throughput_heatmap_sigma=throughput_heatmap_sigma,
+        throughput_contour_color="#000000",
+        throughput_contour_linewidth=0.8,
+    )
+
+
+def parse_legacy_hub_vessels(
     raw_hub_vessels: Sequence[Sequence[float]] | None,
     hub_count: int,
-) -> dict[int, list[VesselSpec]]:
-    vessels_by_hub = {hub_index: [] for hub_index in range(1, hub_count + 1)}
+) -> tuple[dict[str, VesselDefinition], dict[int, dict[str, int]]]:
+    vessel_definitions: dict[str, VesselDefinition] = {}
+    vessels_by_hub = {hub_index: {} for hub_index in range(1, hub_count + 1)}
+    vessel_sequence_by_hub = {hub_index: 0 for hub_index in range(1, hub_count + 1)}
+
     for raw_spec in raw_hub_vessels or []:
         if len(raw_spec) != 4:
             raise ValueError("Each --hub-vessel must provide HUB_INDEX PAYLOAD_TONS SPEED_KNOTS RANGE_NM.")
@@ -1385,114 +1609,269 @@ def parse_hub_vessels(
         if payload_tons <= 0.0 or speed_knots <= 0.0 or range_nm <= 0.0:
             raise ValueError("Payload, speed, and range must all be positive for --hub-vessel.")
 
-        vessels_by_hub[hub_index].append(
-            VesselSpec(payload_tons=payload_tons, speed_knots=speed_knots, range_nm=range_nm)
+        vessel_sequence_by_hub[hub_index] += 1
+        vessel_id = f"hub{hub_index}_vessel{vessel_sequence_by_hub[hub_index]}"
+        vessel_definitions[vessel_id] = VesselDefinition(
+            id=vessel_id,
+            payload_tons=payload_tons,
+            speed_knots=speed_knots,
+            range_nm=range_nm,
         )
-    return vessels_by_hub
+        vessels_by_hub[hub_index][vessel_id] = 1
+
+    return vessel_definitions, vessels_by_hub
 
 
-def parse_hubs(
-    raw_hubs: Sequence[Sequence[float]] | None,
-    raw_hub_vessels: Sequence[Sequence[float]] | None = None,
-) -> list[HubLocation]:
+def build_legacy_scenario_config(args: argparse.Namespace) -> ScenarioConfig:
+    raw_hubs = args.hub or [(12.7, 121.0), (-12.4, 130.8)]
     if not raw_hubs:
-        raw_hubs = [(12.7, 121.0), (-12.4, 130.8)]
-    base_hubs = [HubLocation(lat=float(lat), lon=float(lon)) for lat, lon in raw_hubs]
-    if not base_hubs:
         raise ValueError("At least one hub is required.")
 
-    vessels_by_hub = parse_hub_vessels(raw_hub_vessels, len(base_hubs))
-    return [
-        HubLocation(
-            lat=hub.lat,
-            lon=hub.lon,
-            vessels=tuple(vessels_by_hub[index]),
+    vessel_definitions, vessels_by_hub = parse_legacy_hub_vessels(args.hub_vessel, len(raw_hubs))
+    bbox = BoundingBox(*[float(value) for value in args.bbox])
+    output_type = "range_map" if args.output_mode == "range" else "throughput_field"
+
+    if output_type == "range_map":
+        output_title = "Maritime Operational Reach in Southeast Asia"
+        output_subtitle = f"Round trip: {args.range_nm / 2:.0f} nm | One way: {args.range_nm:.0f} nm"
+        contour_levels: tuple[float, ...] = ()
+        color_scheme = None
+    else:
+        output_title = "Maritime Throughput Capacity in Southeast Asia"
+        output_subtitle = "Sustainment capacity from vessel transport strength and navigable delivery distance"
+        contour_levels = tuple(float(value) for value in args.throughput_contours)
+        color_scheme = args.colormap
+
+    hubs = tuple(
+        HubDefinition(
+            id=f"hub_{index}",
+            label=f"Hub {index}",
+            lat=float(lat),
+            lon=float(lon),
+            vessels=vessels_by_hub[index],
         )
-        for index, hub in enumerate(base_hubs, start=1)
+        for index, (lat, lon) in enumerate(raw_hubs, start=1)
+    )
+    return ScenarioConfig(
+        source_path=REPO_ROOT / "legacy_cli.yaml",
+        defaults_path=None,
+        scenario=ScenarioMetadata(
+            name="legacy_cli",
+            title=output_title,
+            subtitle=output_subtitle,
+        ),
+        map=MapConfig(
+            grid_km=float(args.step_km),
+            projection="mercator",
+            bounding_box=bbox,
+            land_shapefile=args.land_shapefile,
+        ),
+        model=ModelConfig(
+            range_nm=float(args.range_nm),
+            distance_cache=True,
+            min_cycle_days=float(args.min_cycle_days),
+            routing=RoutingConfig(algorithm="dijkstra", knight_moves=True),
+        ),
+        vessels=vessel_definitions,
+        hubs=hubs,
+        visualization=default_visualization_config(
+            throughput_colormap=args.colormap,
+            throughput_heatmap_alpha=float(args.heatmap_alpha),
+            throughput_color_percentile=float(args.color_percentile),
+            throughput_heatmap_sigma=float(args.heatmap_sigma),
+        ),
+        outputs=(
+            OutputConfig(
+                id="legacy_output",
+                type=output_type,
+                title=output_title,
+                subtitle=output_subtitle,
+                bounding_box=bbox,
+                filename=args.output,
+                show_hubs=True,
+                color_scheme=color_scheme,
+                contour_levels=contour_levels,
+            ),
+        ),
+    )
+
+
+def runtime_hubs_from_config(config: ScenarioConfig) -> list[HubLocation]:
+    hubs: list[HubLocation] = []
+    for hub in config.hubs:
+        vessels: list[VesselSpec] = []
+        for vessel_id, count in hub.vessels.items():
+            vessel_definition = config.vessels[vessel_id]
+            for _ in range(count):
+                vessels.append(
+                    VesselSpec(
+                        payload_tons=vessel_definition.payload_tons,
+                        speed_knots=vessel_definition.speed_knots,
+                        range_nm=vessel_definition.range_nm,
+                        name=vessel_definition.id,
+                    )
+                )
+        hubs.append(
+            HubLocation(
+                lat=hub.lat,
+                lon=hub.lon,
+                id=hub.id,
+                label=hub.label,
+                vessels=tuple(vessels),
+            )
+        )
+    return hubs
+
+
+def combine_output_bboxes(outputs: Sequence[OutputConfig]) -> tuple[float, float, float, float]:
+    west = min(output.bounding_box.west for output in outputs)
+    east = max(output.bounding_box.east for output in outputs)
+    south = min(output.bounding_box.south for output in outputs)
+    north = max(output.bounding_box.north for output in outputs)
+    return (west, east, south, north)
+
+
+def max_fleet_range_nm(hubs: Sequence[HubLocation]) -> float:
+    return max((hub.max_vessel_range_nm for hub in hubs), default=0.0)
+
+
+def range_nm_for_output(output: OutputConfig, config: ScenarioConfig) -> float:
+    if output.vessel is not None:
+        return config.vessels[output.vessel].range_nm
+    return config.model.range_nm
+
+
+def routing_range_nm_for_outputs(config: ScenarioConfig, hubs: Sequence[HubLocation]) -> float:
+    routing_ranges: list[float] = []
+    for output in config.outputs:
+        if output.type == "range_map":
+            routing_ranges.append(range_nm_for_output(output, config))
+            continue
+        throughput_range_nm = max_fleet_range_nm(hubs)
+        if throughput_range_nm <= 0.0:
+            raise ValueError("Throughput outputs require at least one configured vessel.")
+        routing_ranges.append(throughput_range_nm)
+    if not routing_ranges:
+        raise ValueError("At least one output is required.")
+    return max(routing_ranges)
+
+
+def select_routed_hubs_for_output(
+    routed_hubs: Sequence[RoutedHub],
+    output: OutputConfig,
+) -> list[RoutedHub]:
+    if output.vessel is None:
+        return list(routed_hubs)
+    return [
+        hub
+        for hub in routed_hubs
+        if any(vessel.name == output.vessel for vessel in hub.original.vessels)
     ]
 
 
-def routing_range_nm_for_mode(
-    hubs: Sequence[HubLocation],
-    output_mode: str,
-    fallback_range_nm: float,
-) -> float:
-    if output_mode == "range":
-        return fallback_range_nm
-
-    throughput_range_nm = max((hub.max_vessel_range_nm for hub in hubs), default=0.0)
-    if throughput_range_nm <= 0.0:
-        raise ValueError("Throughput mode requires at least one --hub-vessel specification.")
-    return throughput_range_nm
-
-
-def main() -> None:
-    args = parse_args()
-    if args.min_cycle_days <= 0.0:
-        raise ValueError("--min-cycle-days must be positive.")
-    if not 0.0 <= args.heatmap_alpha <= 1.0:
-        raise ValueError("--heatmap-alpha must be between 0 and 1.")
-    if not 0.0 < args.color_percentile <= 100.0:
-        raise ValueError("--color-percentile must be greater than 0 and at most 100.")
-    if args.heatmap_sigma < 0.0:
-        raise ValueError("--heatmap-sigma must be non-negative.")
-    hubs = parse_hubs(args.hub, args.hub_vessel)
-    bbox = tuple(float(value) for value in args.bbox)
-    routing_range_nm = routing_range_nm_for_mode(hubs, args.output_mode, args.range_nm)
-    routing_bbox = expand_bbox(bbox, routing_range_nm)
-    detector = load_land_polygons(args.land_shapefile, routing_bbox)
-    grid = build_navigation_grid(detector, routing_bbox, args.step_km)
+def generate_outputs(config: ScenarioConfig) -> tuple[list[Path], list[RoutedHub]]:
+    hubs = runtime_hubs_from_config(config)
+    routing_range_nm = routing_range_nm_for_outputs(config, hubs)
+    routing_bbox = expand_bbox(combine_output_bboxes(config.outputs), routing_range_nm)
+    detector = load_land_polygons(config.map.land_shapefile, routing_bbox)
+    grid = build_navigation_grid(detector, routing_bbox, config.map.grid_km)
     routed_hubs = build_routed_hubs(
         hubs=hubs,
         routing_range_nm=routing_range_nm,
-        step_km=args.step_km,
+        step_km=config.map.grid_km,
         detector=detector,
         grid=grid,
+        routing_algorithm=config.model.routing.algorithm,
+        knight_moves=config.model.routing.knight_moves,
+        use_distance_cache=config.model.distance_cache,
     )
 
-    if args.output_mode == "range":
-        traced_hubs = build_traced_hubs(
-            routed_hubs=routed_hubs,
-            range_nm=args.range_nm,
-            bbox=bbox,
-            detector=detector,
-            grid=grid,
-        )
-        render_map(
-            traced_hubs=traced_hubs,
-            land_union=detector.union,
-            bbox=bbox,
-            range_nm=args.range_nm,
-            output_path=args.output,
-        )
-        hubs_to_report: Sequence[RoutedHub] = traced_hubs
-    else:
-        d_min_nm = grid.min_edge_cost_km / NM_TO_KM
+    throughput_field: np.ndarray | None = None
+    d_min_nm = grid.min_edge_cost_km / NM_TO_KM
+    if any(output.type == "throughput_field" for output in config.outputs):
         throughput_field = compute_throughput_field(
             [hub.distance_field for hub in routed_hubs],
             hubs,
             d_min_nm=d_min_nm,
-            min_cycle_days=args.min_cycle_days,
+            min_cycle_days=config.model.min_cycle_days,
         )
-        render_throughput_map(
-            routed_hubs=routed_hubs,
-            throughput_field=throughput_field,
-            land_union=detector.union,
-            grid=grid,
-            bbox=bbox,
-            contour_levels=args.throughput_contours,
-            output_path=args.output,
-            d_min_nm=d_min_nm,
-            min_cycle_days=args.min_cycle_days,
-            colormap=args.colormap,
-            heatmap_alpha=args.heatmap_alpha,
-            color_percentile=args.color_percentile,
-            heatmap_sigma=args.heatmap_sigma,
-        )
-        hubs_to_report = routed_hubs
 
-    print(f"Saved map to {args.output}")
-    for hub in hubs_to_report:
+    output_paths: list[Path] = []
+    for output in config.outputs:
+        output_path = config.resolve_output_path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        bbox = output.bounding_box.as_tuple()
+
+        if output.type == "range_map":
+            selected_hubs = select_routed_hubs_for_output(routed_hubs, output)
+            range_nm = range_nm_for_output(output, config)
+            subtitle = output.subtitle or f"Round trip: {range_nm / 2:.0f} nm | One way: {range_nm:.0f} nm"
+            traced_hubs = build_traced_hubs(
+                routed_hubs=selected_hubs,
+                range_nm=range_nm,
+                bbox=bbox,
+                detector=detector,
+                grid=grid,
+            )
+            render_map(
+                traced_hubs=traced_hubs,
+                land_union=detector.union,
+                bbox=bbox,
+                range_nm=range_nm,
+                output_path=output_path,
+                title=output.title,
+                subtitle=subtitle,
+                projection=config.map.projection,
+                visualization=config.visualization,
+                show_hubs=output.show_hubs,
+            )
+        else:
+            if throughput_field is None:
+                raise RuntimeError("Throughput field was not computed for throughput output generation.")
+            subtitle = (
+                output.subtitle
+                or "Sustainment capacity from vessel transport strength and navigable delivery distance"
+            )
+            render_throughput_map(
+                routed_hubs=routed_hubs,
+                throughput_field=throughput_field,
+                land_union=detector.union,
+                grid=grid,
+                bbox=bbox,
+                contour_levels=output.contour_levels,
+                output_path=output_path,
+                d_min_nm=d_min_nm,
+                min_cycle_days=config.model.min_cycle_days,
+                colormap=output.color_scheme or config.visualization.throughput_colormap,
+                heatmap_alpha=config.visualization.throughput_heatmap_alpha,
+                color_percentile=config.visualization.throughput_color_percentile,
+                heatmap_sigma=config.visualization.throughput_heatmap_sigma,
+                title=output.title,
+                subtitle=subtitle,
+                projection=config.map.projection,
+                visualization=config.visualization,
+                show_hubs=output.show_hubs,
+            )
+        output_paths.append(output_path)
+
+    return output_paths, routed_hubs
+
+
+def main() -> None:
+    args = parse_args()
+    if args.defaults_config is not None and args.config is None:
+        raise ValueError("--defaults-config requires --config.")
+
+    if args.config is not None:
+        config = load_config(args.config, defaults_path=args.defaults_config)
+    else:
+        validate_legacy_args(args)
+        config = build_legacy_scenario_config(args)
+
+    output_paths, routed_hubs = generate_outputs(config)
+    for output_path in output_paths:
+        print(f"Saved map to {output_path}")
+    for hub in routed_hubs:
         if hub.trace_origin != hub.original:
             print(
                 f"{hub.label}: tracing origin adjusted from "

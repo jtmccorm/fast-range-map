@@ -2,3 +2,4 @@ matplotlib==3.10.8
 pillow==12.1.1
 pyshp==3.0.3
 shapely==2.1.2
+PyYAML==6.0.2

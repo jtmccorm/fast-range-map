@@ -1,6 +1,8 @@
 # Maritime Reach Map Generator
 
-`maritime_reach_map.py` generates a single static PNG visualizing maritime operational reach or theater sustainment throughput from one or more hubs while treating land as an impassable barrier.
+`maritime_reach_map.py` generates static PNGs showing maritime operational reach or theater sustainment throughput while treating land as an impassable barrier.
+
+The preferred interface is now a YAML scenario file. One scenario can define hubs, vessel types, model settings, visualization defaults, and multiple outputs to render in a single run.
 
 ## Setup
 
@@ -12,31 +14,65 @@ Recommended clean install:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python3 maritime_reach_map.py
 ```
 
 Alternative install matching the local setup used during development:
 
 ```bash
 pip install --target .vendor -r requirements.txt
-python3 maritime_reach_map.py
 ```
 
 Notes:
 
 - The script automatically adds `.vendor/` to `sys.path` if that folder exists.
-- The script also sets a local Matplotlib config/cache directory under `.mplconfig/`, so no extra GUI or desktop setup is required.
-- Verified locally with Homebrew `python3` on macOS and the package set in `requirements.txt`.
+- The script sets a local Matplotlib config/cache directory under `.mplconfig/`.
+- YAML scenario loading requires `PyYAML`, which is now included in `requirements.txt`.
 
-## Usage
+## YAML Scenarios
 
-Run the default example from the prompt:
+The repo includes:
+
+- `defaults.yaml`: baseline map, model, and visualization settings.
+- `scenarios/philippines_distribution.yaml`: example scenario with multiple outputs.
+
+Run the example scenario:
 
 ```bash
-python3 maritime_reach_map.py
+python3 maritime_reach_map.py --config scenarios/philippines_distribution.yaml
 ```
 
-Specify your own hubs and range:
+That single command renders every entry under `outputs:` in the scenario file.
+Relative `filename` values from YAML scenarios are written under the repo-level `output/` directory.
+
+Scenario files can define:
+
+- `scenario`: metadata such as `name`, `title`, and `subtitle`
+- `map`: `grid_km`, `projection`, `bounding_box`, and `land_shapefile`
+- `model`: routing settings, distance caching, default range, and minimum cycle time
+- `vessels`: named vessel types
+- `hubs`: locations plus fleet composition by vessel type
+- `visualization`: map colors, font family, figure size, throughput settings, and hub-label behavior
+- `outputs`: one or more `range_map` or `throughput_field` products with per-output titles, subtitles, bounding boxes, filenames, and overrides
+
+Minimal run pattern:
+
+```bash
+python3 maritime_reach_map.py --config path/to/scenario.yaml
+```
+
+Optional defaults override:
+
+```bash
+python3 maritime_reach_map.py \
+  --config path/to/scenario.yaml \
+  --defaults-config path/to/defaults.yaml
+```
+
+## Legacy CLI
+
+The older flag-based interface still works for single-output runs.
+
+Reach map:
 
 ```bash
 python3 maritime_reach_map.py \
@@ -46,7 +82,7 @@ python3 maritime_reach_map.py \
   --output maritime_reach_map.png
 ```
 
-Generate a throughput-capacity map from cached distance fields and vessel specs:
+Throughput map:
 
 ```bash
 python3 maritime_reach_map.py \
@@ -62,17 +98,14 @@ python3 maritime_reach_map.py \
   --color-percentile 97 \
   --heatmap-sigma 1.0 \
   --throughput-contours 5 10 25 50 75 100 \
-  --output ./output/maritime_throughput_map.png    
+  --output output/maritime_throughput_map.png
 ```
 
-`--hub-vessel` takes `HUB_INDEX PAYLOAD_TONS SPEED_KNOTS RANGE_NM` and can be repeated to model multiple vessels or vessel types at the same hub.
-`--min-cycle-days` sets the minimum delivery cycle time assumed for every vessel in throughput mode, which caps each vessel at `payload_tons / min_cycle_days` tons/day near the hub.
-`--colormap` supports `viridis`, `cividis`, `plasma`, and `inferno`; `viridis` remains the default.
-`--color-percentile` caps the heatmap scale at a percentile of visible ocean throughput values, and `--heatmap-sigma 0` disables visualization smoothing if you want the raw grid.
+`--hub-vessel` takes `HUB_INDEX PAYLOAD_TONS SPEED_KNOTS RANGE_NM` and can be repeated to model multiple vessels at the same hub.
 
 ## Benchmarking
 
-In order to test the script on your machine, run the grid-resolution benchmark with:
+Run the grid-resolution benchmark with:
 
 ```bash
 python3 benchmark.py
@@ -80,16 +113,11 @@ python3 benchmark.py
 
 This writes benchmark PNGs and a summary CSV under `benchmarks/`. The CSV includes `step_km`, approximate `grid_cells`, elapsed runtime in seconds, and peak memory in KB for each tested grid resolution.
 
-Grid resolution can greatly affect the routes available in archipelagos (such as the Philipines) altering the estimated distance travelled. This feature allows you to balance accuracy vs runtime in developing graphics.
-
 ## Notes
 
-- The script uses bundled Natural Earth 1:10m land polygons in `data/ne_10m_land/`.
 - Reach is computed with a water-routed cost-distance grid, so paths can bend around coastlines and islands instead of stopping at first landfall.
-- Throughput mode reuses the cached `.npy` distance fields, applies a `1 / max(distance, d_min)` delivery model, caps each vessel at `payload_tons / min_cycle_days` tons/day, and zeros vessel contributions beyond half of each vessel's listed range.
-- Throughput maps use perceptually uniform sequential colormaps, percentile-capped color scaling, an ocean-only raster mask, and optional visualization smoothing to reduce grid artifacts without changing the underlying throughput calculations.
+- Throughput mode reuses cached `.npy` distance fields, applies a `1 / max(distance, d_min)` delivery model, caps each vessel at `payload_tons / min_cycle_days` tons/day, and zeros vessel contributions beyond half of each vessel's listed range.
 - Hubs are rendered at the exact input coordinates. If a hub falls in a land cell, the internal routing origin is snapped to the nearest water cell while keeping the visible marker at the original hub location.
-- `--step-km` controls the routing-grid resolution. Smaller values improve channel fidelity but increase runtime.
-- `--output-mode range` preserves the original reach visualization. `--output-mode throughput` renders a tons/day heatmap plus labeled sustainment contours.
+- `map.projection` currently supports `mercator` and `plate_carree`.
+- `model.routing.knight_moves` controls whether the router can use the existing 2:1 "knight move" shortcuts through narrow archipelagic channels.
 - `--rays` is deprecated and ignored; it remains accepted only for backward compatibility with earlier versions.
-- Default map bounds are `70E to 170E` and `20S to 40N`.
