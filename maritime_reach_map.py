@@ -167,7 +167,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=REPO_ROOT / "maritime_reach_map.png",
+        default=REPO_ROOT / "output/maritime_reach_map.png",
         help="Output PNG path. Default: maritime_reach_map.png.",
     )
     return parser.parse_args()
