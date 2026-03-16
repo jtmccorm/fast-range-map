@@ -45,8 +45,8 @@ hubs:
 outputs:
   - id: theater_throughput
     type: throughput_field
-    title: "Theater Sustainment Capacity"
-    subtitle: "LCU + ARV Fleet"
+    title: "Philippines Sustainment Capacity"
+    subtitle: "LCU + ARV Fleet (Notional Data)"
     bounding_box:
       west: 70
       east: 170
@@ -55,16 +55,16 @@ outputs:
     color_scheme: viridis
     contour_levels: [100, 200, 300, 400, 500]
     show_hubs: true
-    filename: output/throughput_field.png
+    filename: output/throughput_example.png
   - id: lcu_range
     type: range_map
-    vessel: LCU
-    title: "LCU Operational Reach"
-    subtitle: "One-way and round-trip reach from configured LCU hubs"
+    vessel: ARV
+    title: "ARV Operational Reach"
+    subtitle: "One-way and round-trip reach from configured ARV hubs"
     bounding_box:
       west: 70
       east: 170
       south: -20
       north: 40
     show_hubs: true
-    filename: output/lcu_range.png
+    filename: output/range_example.png

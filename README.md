@@ -1,6 +1,8 @@
 # Maritime Reach Map Generator
 
-`maritime_reach_map.py` generates static PNGs showing maritime operational reach or theater sustainment throughput while treating land as an impassable barrier.
+`maritime_reach_map.py` generates static PNGs showing maritime operational reach or theater sustainment throughput while treating land as an impassable barrier. This allows sustianment planners to visualize their distribution network's capacity in real operational geometry
+
+![Throughput example output](output/throughput_example.png)
 
 The preferred interface is now a YAML scenario file. One scenario can define hubs, vessel types, model settings, visualization defaults, and multiple outputs to render in a single run.
 

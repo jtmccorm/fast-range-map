@@ -5,6 +5,8 @@ __pycache__/
 maritime_reach_map.png
 subic_darwin_map.png
 output/
+!output/throughput_example.png
+!output/range_example.png
 benchmarks/
 cache/
 .DS_Store
