@@ -5,4 +5,5 @@ __pycache__/
 maritime_reach_map.png
 subic_darwin_map.png
 output/
+benchmarks/
 .DS_Store

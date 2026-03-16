@@ -46,6 +46,18 @@ python3 maritime_reach_map.py \
   --output maritime_reach_map.png
 ```
 
+## Benchmarking
+
+In order to test the script on your machine, run the grid-resolution benchmark with:
+
+```bash
+python3 benchmark.py
+```
+
+This writes benchmark PNGs and a summary CSV under `benchmarks/`. The CSV includes `step_km`, approximate `grid_cells`, elapsed runtime in seconds, and peak memory in KB for each tested grid resolution.
+
+Grid resolution can greatly affect the routes available in archipelagos (such as the Philipines) altering the estimated distance travelled. This feature allows you to balance accuracy vs runtime in developing graphics.
+
 ## Notes
 
 - The script uses bundled Natural Earth 1:10m land polygons in `data/ne_10m_land/`.
