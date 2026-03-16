@@ -51,6 +51,14 @@ NEIGHBOR_DELTAS = (
     (-1, 1),
     (1, -1),
     (1, 1),
+    (-2, -1),
+    (-2, 1),
+    (-1, -2),
+    (-1, 2),
+    (1, -2),
+    (1, 2),
+    (2, -1),
+    (2, 1),
 )
 
 
@@ -407,25 +415,9 @@ def compute_cost_distance(
         if visited[row, col]:
             continue
         visited[row, col] = True
-        global_row = row_start + row
-
-        for delta_row, delta_col in NEIGHBOR_DELTAS:
-            next_row = row + delta_row
-            next_col = col + delta_col
-            if (
-                next_row < 0
-                or next_row >= water_mask.shape[0]
-                or next_col < 0
-                or next_col >= water_mask.shape[1]
-                or not water_mask[next_row, next_col]
-            ):
-                continue
-
-            if delta_row != 0 and delta_col != 0:
-                if not water_mask[row + delta_row, col] or not water_mask[row, col + delta_col]:
-                    continue
-
-            step_cost = movement_cost_km(grid, global_row, delta_row, delta_col)
+        for next_row, next_col, step_cost in iter_navigable_neighbors(
+            grid, water_mask, row, col, row_start, col_start
+        ):
             proposed_distance = current_distance + step_cost
             if proposed_distance >= distances[next_row, next_col] or proposed_distance > max_distance_km:
                 continue
@@ -446,6 +438,83 @@ def movement_cost_km(
     if delta_row < 0:
         return float(grid.diag_up_cost_km[row])
     return float(grid.diag_down_cost_km[row])
+
+
+def iter_navigable_neighbors(
+    grid: NavigationGrid,
+    water_mask: np.ndarray,
+    row: int,
+    col: int,
+    row_offset: int,
+    col_offset: int,
+) -> Iterator[tuple[int, int, float]]:
+    global_row = row_offset + row
+    global_col = col_offset + col
+
+    for delta_row, delta_col in NEIGHBOR_DELTAS:
+        next_row = row + delta_row
+        next_col = col + delta_col
+        if (
+            next_row < 0
+            or next_row >= water_mask.shape[0]
+            or next_col < 0
+            or next_col >= water_mask.shape[1]
+            or not water_mask[next_row, next_col]
+        ):
+            continue
+        if not move_is_clear(water_mask, row, col, delta_row, delta_col):
+            continue
+        yield next_row, next_col, edge_cost_km(grid, global_row, global_col, delta_row, delta_col)
+
+
+def move_is_clear(
+    water_mask: np.ndarray, row: int, col: int, delta_row: int, delta_col: int
+) -> bool:
+    abs_row = abs(delta_row)
+    abs_col = abs(delta_col)
+
+    if abs_row <= 1 and abs_col <= 1:
+        if abs_row == 1 and abs_col == 1:
+            return bool(water_mask[row + delta_row, col] and water_mask[row, col + delta_col])
+        return True
+
+    if sorted((abs_row, abs_col)) != [1, 2]:
+        return False
+
+    return any(
+        all(water_mask[row + offset_row, col + offset_col] for offset_row, offset_col in path_offsets)
+        for path_offsets in knight_path_offsets(delta_row, delta_col)
+    )
+
+
+def knight_path_offsets(delta_row: int, delta_col: int) -> tuple[tuple[tuple[int, int], ...], ...]:
+    row_step = 1 if delta_row > 0 else -1
+    col_step = 1 if delta_col > 0 else -1
+
+    if abs(delta_row) == 2:
+        return (
+            ((row_step, 0), (2 * row_step, 0)),
+            ((row_step, 0), (row_step, col_step)),
+            ((0, col_step), (row_step, col_step)),
+        )
+
+    return (
+        ((0, col_step), (0, 2 * col_step)),
+        ((0, col_step), (row_step, col_step)),
+        ((row_step, 0), (row_step, col_step)),
+    )
+
+
+def edge_cost_km(grid: NavigationGrid, row: int, col: int, delta_row: int, delta_col: int) -> float:
+    if max(abs(delta_row), abs(delta_col)) == 1:
+        return movement_cost_km(grid, row, delta_row, delta_col)
+
+    return great_circle_distance_km(
+        grid.lat_centers[row],
+        grid.lon_centers[col],
+        grid.lat_centers[row + delta_row],
+        grid.lon_centers[col + delta_col],
+    )
 
 
 def build_reach_polygon(
