@@ -1,0 +1,68 @@
+defaults: ../defaults.yaml
+
+scenario:
+  name: usarpac_current_fleet
+  title: "USARPAC Maritime Distribution Capacity"
+  subtitle: "Approximate Current Watercraft Fleet Posture"
+
+map:
+  grid_km: 8
+  bounding_box:
+    west: 100
+    east: -140
+    south: -40
+    north: 55
+
+model:
+  min_cycle_days: 1.0
+
+vessels:
+
+  LSV:
+    payload_tons: 2000
+    speed_knots: 12
+    range_nm: 13000
+
+  LCU:
+    payload_tons: 350
+    speed_knots: 11
+    range_nm: 2400
+
+  OSV:
+    payload_tons: 350
+    speed_knots: 12
+    range_nm: 8000
+
+hubs:
+
+  - id: honolulu
+    label: "Honolulu Harbor"
+    lat: 21.3069
+    lon: -157.8650
+    vessels:
+      LSV: 3
+      OSV: 2
+
+  - id: yokohama
+    label: "Yokohama North Dock"
+    lat: 34.709465 
+    lon: 139.745348
+    vessels:
+      LSV: 2
+      LCU: 5
+
+outputs:
+
+  - id: theater_capacity
+    type: throughput_field
+    title: "8th TSC/ USARPAC - Surface Vessel Throughput Capacity"
+    subtitle: "Current Army Watercraft Posture (Approx.)"
+    bounding_box:
+      west: 100
+      east: -140
+      south: -40
+      north: 55
+    color_scheme: viridis
+    contour_levels: [100, 250, 500, 750, 1000, 1250, 1500, 1750, 2000]
+    show_hubs: true
+    filename: output/usarpac_capacity_corrected.png

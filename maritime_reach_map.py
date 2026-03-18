@@ -36,6 +36,7 @@ from matplotlib.path import Path as MplPath
 from matplotlib.ticker import FuncFormatter, MultipleLocator
 from PIL import Image, ImageDraw
 from shapely import STRtree
+from shapely.affinity import translate
 from shapely.geometry import GeometryCollection, MultiPolygon, Point, Polygon, box, shape
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import unary_union
@@ -190,12 +191,20 @@ class NavigationGrid:
     def cols(self) -> int:
         return int(self.lon_centers.size)
 
+    @property
+    def center_lon(self) -> float:
+        return (self.min_lon + self.max_lon) / 2.0
+
+    def align_lon(self, lon: float) -> float:
+        return align_longitude(lon, self.center_lon)
+
     def cell_center(self, row: int, col: int) -> HubLocation:
         return HubLocation(lat=float(self.lat_centers[row]), lon=float(self.lon_centers[col]))
 
     def coord_to_cell(self, lat: float, lon: float) -> tuple[int, int]:
         row = int(math.floor((lat - self.min_lat) / self.lat_step_deg))
-        col = int(math.floor((lon - self.min_lon) / self.lon_step_deg))
+        aligned_lon = self.align_lon(lon)
+        col = int(math.floor((aligned_lon - self.min_lon) / self.lon_step_deg))
         row = max(0, min(self.rows - 1, row))
         col = max(0, min(self.cols - 1, col))
         return row, col
@@ -336,6 +345,12 @@ def normalize_longitude(lon: float) -> float:
     return (lon + 540.0) % 360.0 - 180.0
 
 
+def align_longitude(lon: float, reference_longitude: float) -> float:
+    normalized = normalize_longitude(lon)
+    shift_turns = math.floor(((reference_longitude - normalized) / 360.0) + 0.5)
+    return normalized + 360.0 * shift_turns
+
+
 def destination_point(
     start_lat: float, start_lon: float, bearing_deg: float, distance_km: float
 ) -> tuple[float, float]:
@@ -377,9 +392,15 @@ def expand_bbox(
 ) -> tuple[float, float, float, float]:
     min_lon, max_lon, min_lat, max_lat = bbox
     margin_deg = max(6.0, range_nm / 60.0 + 2.0)
+    expanded_min_lon = min_lon - margin_deg
+    expanded_max_lon = max_lon + margin_deg
+    if expanded_max_lon - expanded_min_lon >= 359.8:
+        midpoint = (expanded_min_lon + expanded_max_lon) / 2.0
+        expanded_min_lon = midpoint - 179.9
+        expanded_max_lon = midpoint + 179.9
     return (
-        max(-179.9, min_lon - margin_deg),
-        min(179.9, max_lon + margin_deg),
+        expanded_min_lon,
+        expanded_max_lon,
         max(-89.9, min_lat - margin_deg),
         min(89.9, max_lat + margin_deg),
     )
@@ -399,12 +420,14 @@ def load_land_polygons(
     reader = shapefile.Reader(str(shapefile_path))
     for shp in reader.iterShapes():
         geom = shape(shp.__geo_interface__)
-        if not geom.intersects(search_region):
-            continue
-        clipped = geom.intersection(search_region)
-        for polygon in iter_polygons(clipped):
-            if not polygon.is_empty:
-                polygons.append(polygon)
+        for offset in (-360.0, 0.0, 360.0):
+            shifted = geom if offset == 0.0 else translate(geom, xoff=offset)
+            if not shifted.intersects(search_region):
+                continue
+            clipped = shifted.intersection(search_region)
+            for polygon in iter_polygons(clipped):
+                if not polygon.is_empty:
+                    polygons.append(polygon)
 
     if not polygons:
         raise RuntimeError("No land polygons intersect the requested region.")
@@ -499,9 +522,16 @@ def build_navigation_grid(
 def snap_hub_to_water(
     hub: HubLocation, detector: LandDetector, grid: NavigationGrid
 ) -> tuple[HubLocation, tuple[int, int]]:
+    aligned_hub = HubLocation(
+        lat=hub.lat,
+        lon=grid.align_lon(hub.lon),
+        id=hub.id,
+        label=hub.label,
+        vessels=hub.vessels,
+    )
     row, col = grid.coord_to_cell(hub.lat, hub.lon)
-    if grid.water_mask[row, col] and not detector.is_land(hub.lon, hub.lat):
-        return hub, (row, col)
+    if grid.water_mask[row, col] and not detector.is_land(aligned_hub.lon, aligned_hub.lat):
+        return aligned_hub, (row, col)
 
     snapped_row, snapped_col = find_nearest_water_cell(grid, row, col)
     return grid.cell_center(snapped_row, snapped_col), (snapped_row, snapped_col)
@@ -939,8 +969,9 @@ def format_lat(value: float, _position: float) -> str:
 
 
 def format_lon(value: float, _position: float) -> str:
-    suffix = "E" if value >= 0 else "W"
-    return f"{abs(value):.0f}°{suffix}"
+    normalized = normalize_longitude(value)
+    suffix = "E" if normalized >= 0 else "W"
+    return f"{abs(normalized):.0f}°{suffix}"
 
 
 def add_land_layer(
@@ -971,9 +1002,11 @@ def add_hub_markers(
     visualization: VisualizationConfig,
 ) -> None:
     min_lon, max_lon, min_lat, max_lat = bbox
+    center_lon = (min_lon + max_lon) / 2.0
     for hub in hubs:
+        display_lon = align_longitude(hub.original.lon, center_lon)
         ax.scatter(
-            hub.original.lon,
+            display_lon,
             hub.original.lat,
             s=72,
             facecolor=visualization.hub_marker_color,
@@ -981,7 +1014,7 @@ def add_hub_markers(
             linewidth=1.0,
             zorder=6,
         )
-        offset_lon = 1.1 if hub.original.lon <= (min_lon + max_lon) / 2.0 else -1.1
+        offset_lon = 1.1 if display_lon <= center_lon else -1.1
         offset_lat = 0.9 if hub.original.lat <= (min_lat + max_lat) / 2.0 else -0.9
         horizontal_alignment = "left" if offset_lon > 0 else "right"
         vertical_alignment = "bottom" if offset_lat > 0 else "top"
@@ -989,7 +1022,7 @@ def add_hub_markers(
         if visualization.show_hub_coordinates:
             label = f"{label}\n({hub.original.lat:.2f}, {hub.original.lon:.2f})"
         text = ax.text(
-            hub.original.lon + offset_lon,
+            display_lon + offset_lon,
             hub.original.lat + offset_lat,
             label,
             fontsize=9,
@@ -1724,11 +1757,31 @@ def runtime_hubs_from_config(config: ScenarioConfig) -> list[HubLocation]:
 
 
 def combine_output_bboxes(outputs: Sequence[OutputConfig]) -> tuple[float, float, float, float]:
-    west = min(output.bounding_box.west for output in outputs)
-    east = max(output.bounding_box.east for output in outputs)
-    south = min(output.bounding_box.south for output in outputs)
-    north = max(output.bounding_box.north for output in outputs)
+    if not outputs:
+        raise ValueError("At least one output is required.")
+
+    west, east, south, north = outputs[0].bounding_box.as_unwrapped_tuple()
+    for output in outputs[1:]:
+        output_west, output_east, output_south, output_north = output.bounding_box.as_unwrapped_tuple(
+            reference_longitude=(west + east) / 2.0
+        )
+        west = min(west, output_west)
+        east = max(east, output_east)
+        south = min(south, output_south)
+        north = max(north, output_north)
     return (west, east, south, north)
+
+
+def hubs_share_same_coordinates(
+    left: HubLocation,
+    right: HubLocation,
+    *,
+    tolerance: float = 1e-6,
+) -> bool:
+    return (
+        abs(left.lat - right.lat) <= tolerance
+        and abs(normalize_longitude(left.lon - right.lon)) <= tolerance
+    )
 
 
 def max_fleet_range_nm(hubs: Sequence[HubLocation]) -> float:
@@ -1797,10 +1850,11 @@ def generate_outputs(config: ScenarioConfig) -> tuple[list[Path], list[RoutedHub
         )
 
     output_paths: list[Path] = []
+    routing_center_lon = (grid.min_lon + grid.max_lon) / 2.0
     for output in config.outputs:
         output_path = config.resolve_output_path(output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        bbox = output.bounding_box.as_tuple()
+        bbox = output.bounding_box.as_unwrapped_tuple(reference_longitude=routing_center_lon)
 
         if output.type == "range_map":
             selected_hubs = select_routed_hubs_for_output(routed_hubs, output)
@@ -1872,7 +1926,7 @@ def main() -> None:
     for output_path in output_paths:
         print(f"Saved map to {output_path}")
     for hub in routed_hubs:
-        if hub.trace_origin != hub.original:
+        if not hubs_share_same_coordinates(hub.trace_origin, hub.original):
             print(
                 f"{hub.label}: tracing origin adjusted from "
                 f"({hub.original.lat:.3f}, {hub.original.lon:.3f}) to "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -40,8 +41,40 @@ class BoundingBox:
     south: float
     north: float
 
+    def __post_init__(self) -> None:
+        values = (self.west, self.east, self.south, self.north)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("Bounding box values must be finite.")
+        if self.longitude_span_deg >= 360.0:
+            raise ValueError("Bounding box longitude span must be greater than 0 and less than 360 degrees.")
+        if self.south >= self.north:
+            raise ValueError("Bounding box south must be less than north.")
+
     def as_tuple(self) -> tuple[float, float, float, float]:
         return (self.west, self.east, self.south, self.north)
+
+    @property
+    def crosses_antimeridian(self) -> bool:
+        return self.east <= self.west
+
+    @property
+    def longitude_span_deg(self) -> float:
+        east = self.east + 360.0 if self.crosses_antimeridian else self.east
+        return east - self.west
+
+    def as_unwrapped_tuple(
+        self,
+        *,
+        reference_longitude: float | None = None,
+    ) -> tuple[float, float, float, float]:
+        west = self.west
+        east = self.west + self.longitude_span_deg
+        if reference_longitude is not None:
+            midpoint = (west + east) / 2.0
+            shift_turns = math.floor(((reference_longitude - midpoint) / 360.0) + 0.5)
+            west += 360.0 * shift_turns
+            east += 360.0 * shift_turns
+        return (west, east, self.south, self.north)
 
     @classmethod
     def from_mapping(cls, value: Any, field_name: str) -> "BoundingBox":
@@ -56,11 +89,10 @@ class BoundingBox:
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{field_name} values must be numeric.") from exc
 
-        if west >= east:
-            raise ValueError(f"{field_name}.west must be less than {field_name}.east.")
-        if south >= north:
-            raise ValueError(f"{field_name}.south must be less than {field_name}.north.")
-        return cls(west=west, east=east, south=south, north=north)
+        try:
+            return cls(west=west, east=east, south=south, north=north)
+        except ValueError as exc:
+            raise ValueError(f"{field_name}: {exc}") from exc
 
 
 @dataclass(frozen=True)

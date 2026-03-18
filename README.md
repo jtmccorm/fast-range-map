@@ -56,6 +56,8 @@ Scenario files can define:
 - `visualization`: map colors, font family, figure size, throughput settings, and hub-label behavior
 - `outputs`: one or more `range_map` or `throughput_field` products with per-output titles, subtitles, bounding boxes, filenames, and overrides
 
+Bounding boxes can cross the antimeridian. To render Pacific views, set `west` greater than `east`, for example `west: 100` and `east: -140`.
+
 Minimal run pattern:
 
 ```bash
