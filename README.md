@@ -56,6 +56,24 @@ Scenario files can define:
 - `visualization`: map colors, font family, figure size, throughput settings, and hub-label behavior
 - `outputs`: one or more `range_map` or `throughput_field` products with per-output titles, subtitles, bounding boxes, filenames, and overrides
 
+Throughput outputs can optionally translate raw `tons/day` into operational sustainment equivalents at display time:
+
+```yaml
+outputs:
+  - id: theater_throughput
+    type: throughput_field
+    filename: output/throughput_example.png
+    contour_levels: [100, 200, 300, 400, 500]
+    operational_legend:
+      enabled: true
+      unit_type: ibct
+      display_mode: dual
+      consumption_rate_tons_per_day: 300
+```
+
+`operational_legend` also accepts the shorthand `true` or `false`. Supported `unit_type` values are `ibct`, `abct`, `battalion`, and `custom`. When enabled, the renderer keeps the underlying throughput model in raw `tons/day`, but rescales the heatmap, contour labels, colorbar text, and on-map legend for display. `display_mode: dual` adds raw-rate context to the legend/footer while still plotting the translated operational units.
+Existing `contour_levels` remain raw throughput thresholds in `tons/day`; the renderer converts them to the selected operational unit for annotation only.
+
 Bounding boxes can cross the antimeridian. To render Pacific views, set `west` greater than `east`, for example `west: 100` and `east: -140`.
 
 Minimal run pattern:
@@ -121,6 +139,7 @@ This writes benchmark PNGs and a summary CSV under `benchmarks/`. The CSV includ
 
 - Reach is computed with a water-routed cost-distance grid, so paths can bend around coastlines and islands instead of stopping at first landfall.
 - Throughput mode reuses cached `.npy` distance fields, applies a `1 / max(distance, d_min)` delivery model, caps each vessel at `payload_tons / min_cycle_days` tons/day, and zeros vessel contributions beyond half of each vessel's listed range.
+- Operational legend mode is a display-only layer on top of the same throughput field. The default notional translation rates are `IBCT=300`, `ABCT=700`, and `battalion=75` tons/day, and each can be overridden per output in YAML.
 - Hubs are rendered at the exact input coordinates. If a hub falls in a land cell, the internal routing origin is snapped to the nearest water cell while keeping the visible marker at the original hub location.
 - `map.projection` currently supports `mercator` and `plate_carree`.
 - `model.routing.knight_moves` controls whether the router can use the existing 2:1 "knight move" shortcuts through narrow archipelagic channels.

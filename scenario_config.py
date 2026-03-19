@@ -15,6 +15,8 @@ except ImportError:  # pragma: no cover - handled at runtime when YAML loading i
 SUPPORTED_OUTPUT_TYPES = frozenset({"range_map", "throughput_field"})
 SUPPORTED_PROJECTIONS = frozenset({"mercator", "plate_carree"})
 SUPPORTED_ROUTING_ALGORITHMS = frozenset({"dijkstra"})
+SUPPORTED_OPERATIONAL_UNIT_TYPES = frozenset({"ibct", "abct", "battalion", "custom"})
+SUPPORTED_OPERATIONAL_DISPLAY_MODES = frozenset({"translated", "dual"})
 
 DEFAULT_LAND_COLOR = "#cbb89d"
 DEFAULT_COASTLINE_COLOR = "#3a3a3a"
@@ -32,6 +34,24 @@ DEFAULT_RANGE_ROUND_TRIP_FILL_COLOR = "#4f83cc"
 DEFAULT_RANGE_ROUND_TRIP_EDGE_COLOR = "#2c5ea8"
 DEFAULT_OVERLAP_FILL_COLOR = "#7b2cbf"
 DEFAULT_OVERLAP_EDGE_COLOR = "#5a189a"
+DEFAULT_OPERATIONAL_UNIT_RATES_TPD = {
+    "ibct": 300.0,
+    "abct": 700.0,
+    "battalion": 75.0,
+    "custom": 100.0,
+}
+DEFAULT_OPERATIONAL_UNIT_LABELS = {
+    "ibct": "IBCT days of sustainment",
+    "abct": "ABCT days of sustainment",
+    "battalion": "Battalion days of sustainment",
+    "custom": "Custom sustainment equivalents",
+}
+DEFAULT_OPERATIONAL_UNIT_ABBREVIATIONS = {
+    "ibct": "IBCT",
+    "abct": "ABCT",
+    "battalion": "BN",
+    "custom": "EQ",
+}
 
 
 @dataclass(frozen=True)
@@ -176,6 +196,16 @@ class VisualizationConfig:
 
 
 @dataclass(frozen=True)
+class OperationalLegendConfig:
+    enabled: bool
+    unit_type: str
+    display_mode: str
+    consumption_rate_tons_per_day: float
+    unit_label: str
+    unit_abbreviation: str
+
+
+@dataclass(frozen=True)
 class OutputConfig:
     id: str
     type: str
@@ -186,6 +216,14 @@ class OutputConfig:
     show_hubs: bool
     color_scheme: str | None = None
     contour_levels: tuple[float, ...] = ()
+    operational_legend: OperationalLegendConfig = OperationalLegendConfig(
+        enabled=False,
+        unit_type="ibct",
+        display_mode="translated",
+        consumption_rate_tons_per_day=DEFAULT_OPERATIONAL_UNIT_RATES_TPD["ibct"],
+        unit_label=DEFAULT_OPERATIONAL_UNIT_LABELS["ibct"],
+        unit_abbreviation=DEFAULT_OPERATIONAL_UNIT_ABBREVIATIONS["ibct"],
+    )
     vessel: str | None = None
 
 
@@ -563,12 +601,67 @@ def _parse_outputs(
                 show_hubs=_boolean(output_mapping.get("show_hubs"), f"{field_name}.show_hubs", default=True),
                 color_scheme=_optional_string(output_mapping.get("color_scheme")),
                 contour_levels=_float_tuple(contour_levels_value, f"{field_name}.contour_levels"),
+                operational_legend=_parse_operational_legend(
+                    output_mapping.get("operational_legend"),
+                    f"{field_name}.operational_legend",
+                ),
                 vessel=_optional_string(output_mapping.get("vessel")),
             )
         )
     if not outputs:
         raise ValueError("At least one output is required.")
     return outputs
+
+
+def _default_operational_legend_config(unit_type: str, *, enabled: bool) -> OperationalLegendConfig:
+    return OperationalLegendConfig(
+        enabled=enabled,
+        unit_type=unit_type,
+        display_mode="translated",
+        consumption_rate_tons_per_day=DEFAULT_OPERATIONAL_UNIT_RATES_TPD[unit_type],
+        unit_label=DEFAULT_OPERATIONAL_UNIT_LABELS[unit_type],
+        unit_abbreviation=DEFAULT_OPERATIONAL_UNIT_ABBREVIATIONS[unit_type],
+    )
+
+
+def _parse_operational_legend(value: Any, field_name: str) -> OperationalLegendConfig:
+    if value is None:
+        return _default_operational_legend_config("ibct", enabled=False)
+    if isinstance(value, bool):
+        return _default_operational_legend_config("ibct", enabled=value)
+
+    mapping = _require_mapping(value, field_name)
+    unit_type = _normalize_choice(
+        mapping.get("unit_type"),
+        f"{field_name}.unit_type",
+        supported=SUPPORTED_OPERATIONAL_UNIT_TYPES,
+        default="ibct",
+    )
+    default_config = _default_operational_legend_config(unit_type, enabled=True)
+    raw_rate_value = mapping.get("consumption_rate_tons_per_day", mapping.get("consumption_rate"))
+    if unit_type == "custom" and raw_rate_value is None:
+        raise ValueError(f"{field_name}.consumption_rate_tons_per_day is required when unit_type is 'custom'.")
+
+    return OperationalLegendConfig(
+        enabled=_boolean(mapping.get("enabled"), f"{field_name}.enabled", default=True),
+        unit_type=unit_type,
+        display_mode=_normalize_choice(
+            mapping.get("display_mode"),
+            f"{field_name}.display_mode",
+            supported=SUPPORTED_OPERATIONAL_DISPLAY_MODES,
+            default=default_config.display_mode,
+        ),
+        consumption_rate_tons_per_day=_positive_float(
+            raw_rate_value,
+            f"{field_name}.consumption_rate_tons_per_day",
+            default=default_config.consumption_rate_tons_per_day,
+        ),
+        unit_label=_optional_string(mapping.get("unit_label"), default=default_config.unit_label),
+        unit_abbreviation=_optional_string(
+            mapping.get("unit_abbreviation"),
+            default=default_config.unit_abbreviation,
+        ),
+    )
 
 
 def _require_yaml():

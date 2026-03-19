@@ -46,6 +46,7 @@ from scenario_config import (
     HubDefinition,
     MapConfig,
     ModelConfig,
+    OperationalLegendConfig,
     OutputConfig,
     RoutingConfig,
     ScenarioConfig,
@@ -208,6 +209,105 @@ class NavigationGrid:
         row = max(0, min(self.rows - 1, row))
         col = max(0, min(self.cols - 1, col))
         return row, col
+
+
+@dataclass(frozen=True)
+class ThroughputDisplayTransform:
+    enabled: bool
+    display_mode: str
+    scale: float
+    unit_label: str
+    unit_abbreviation: str
+    consumption_rate_tons_per_day: float | None = None
+
+    @classmethod
+    def from_config(cls, config: OperationalLegendConfig) -> "ThroughputDisplayTransform":
+        if not config.enabled:
+            return cls(
+                enabled=False,
+                display_mode="raw",
+                scale=1.0,
+                unit_label="tons/day",
+                unit_abbreviation="tons/day",
+            )
+        return cls(
+            enabled=True,
+            display_mode=config.display_mode,
+            scale=1.0 / config.consumption_rate_tons_per_day,
+            unit_label=config.unit_label,
+            unit_abbreviation=config.unit_abbreviation,
+            consumption_rate_tons_per_day=config.consumption_rate_tons_per_day,
+        )
+
+    @property
+    def colorbar_label(self) -> str:
+        if not self.enabled:
+            return "Throughput Capacity (tons/day)"
+        if self.display_mode == "dual" and self.consumption_rate_tons_per_day is not None:
+            return (
+                f"Operational Capacity ({self.unit_label}; "
+                f"1 {self.unit_abbreviation} = {self.consumption_rate_tons_per_day:,.0f} tons/day)"
+            )
+        return f"Operational Capacity ({self.unit_label})"
+
+    @property
+    def legend_text(self) -> str | None:
+        if not self.enabled or self.consumption_rate_tons_per_day is None:
+            return None
+        lines = [
+            "Operational Translation",
+            self.unit_label,
+            f"1 {self.unit_abbreviation} = {self.consumption_rate_tons_per_day:,.0f} tons/day",
+        ]
+        if self.display_mode == "dual":
+            lines.append("Contour labels: operational + t/day")
+        return "\n".join(lines)
+
+    @property
+    def footer_note(self) -> str | None:
+        if not self.enabled or self.consumption_rate_tons_per_day is None:
+            return None
+        note = f"Operational display = {self.unit_abbreviation} @ {self.consumption_rate_tons_per_day:,.0f} tons/day"
+        if self.display_mode == "dual":
+            note += " | Dual contour labels"
+        return note
+
+    def transform_field(self, values: np.ndarray) -> np.ndarray:
+        if not self.enabled:
+            return values
+        return (values * self.scale).astype(np.float32, copy=False)
+
+    def transform_levels(self, values: Sequence[float]) -> tuple[float, ...]:
+        if not self.enabled:
+            return tuple(float(value) for value in values)
+        return tuple(float(value) * self.scale for value in values)
+
+    def format_value(self, value: float) -> str:
+        if not np.isfinite(value):
+            return ""
+        if not self.enabled:
+            return f"{value:,.0f}"
+
+        absolute_value = abs(float(value))
+        if absolute_value >= 100.0:
+            precision = 0
+        elif absolute_value >= 1.0:
+            precision = 1
+        else:
+            precision = 2
+        formatted = f"{value:,.{precision}f}"
+        if precision > 0:
+            formatted = formatted.rstrip("0").rstrip(".")
+        return formatted
+
+    def format_contour_value(self, value: float) -> str:
+        formatted = self.format_value(value)
+        if not self.enabled:
+            return formatted
+        if self.display_mode == "dual":
+            raw_value = value / self.scale
+            return f"{formatted} {self.unit_abbreviation} / {raw_value:,.0f} t/day"
+        return f"{formatted} {self.unit_abbreviation}"
 
 
 class LandDetector:
@@ -1187,7 +1287,7 @@ def compute_heatmap_vmax(
         return 1.0
     percentile_value = float(np.percentile(visible_positive, percentile))
     minimum_positive = float(visible_positive.min())
-    return max(percentile_value, minimum_positive, 1.0)
+    return max(percentile_value, minimum_positive, float(np.finfo(np.float32).eps))
 
 
 def plot_throughput_heatmap(
@@ -1211,7 +1311,7 @@ def plot_throughput_heatmap(
         cmap=heatmap_cmap,
         interpolation="nearest",
         vmin=0.0,
-        vmax=max(maximum_value, 1.0),
+        vmax=max(maximum_value, float(np.finfo(np.float32).eps)),
         alpha=alpha,
         zorder=2,
     )
@@ -1223,6 +1323,7 @@ def plot_throughput_contours(
     grid: NavigationGrid,
     contour_levels: Sequence[float] = (50.0, 100.0, 250.0, 500.0),
     *,
+    display_transform: ThroughputDisplayTransform,
     contour_color: str,
     contour_linewidth: float,
 ):
@@ -1248,10 +1349,42 @@ def plot_throughput_contours(
         alpha=0.7,
         zorder=5,
     )
-    labels = ax.clabel(contours, fmt=lambda value: f"{value:,.0f}", inline=True, fontsize=8)
+    labels = ax.clabel(
+        contours,
+        fmt=lambda value: display_transform.format_contour_value(value),
+        inline=True,
+        fontsize=8,
+    )
     for text in labels:
         text.set_path_effects([path_effects.withStroke(linewidth=1.2, foreground="white")])
     return contours
+
+
+def add_operational_translation_legend(
+    ax: plt.Axes,
+    display_transform: ThroughputDisplayTransform,
+    visualization: VisualizationConfig,
+) -> None:
+    legend_text = display_transform.legend_text
+    if legend_text is None:
+        return
+    ax.text(
+        0.016,
+        0.984,
+        legend_text,
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=9,
+        color=visualization.tick_color,
+        bbox={
+            "boxstyle": "round,pad=0.35",
+            "facecolor": "white",
+            "edgecolor": visualization.spine_color,
+            "alpha": 0.94,
+        },
+        zorder=7,
+    )
 
 
 def render_map(
@@ -1398,9 +1531,12 @@ def render_throughput_map(
     title: str,
     subtitle: str,
     projection: str,
+    operational_legend: OperationalLegendConfig,
     visualization: VisualizationConfig,
     show_hubs: bool,
 ) -> None:
+    display_transform = ThroughputDisplayTransform.from_config(operational_legend)
+
     with matplotlib.rc_context({"font.family": visualization.font_family}):
         fig, ax = plt.subplots(
             figsize=(visualization.figure_width, visualization.figure_height),
@@ -1415,20 +1551,22 @@ def render_throughput_map(
             grid,
             sigma=heatmap_sigma,
         )
+        display_field = display_transform.transform_field(visualization_field)
         heatmap = plot_throughput_heatmap(
             ax,
-            visualization_field,
+            display_field,
             grid,
             cmap_name=colormap,
             alpha=heatmap_alpha,
-            vmax=compute_heatmap_vmax(visualization_field, grid, color_percentile),
+            vmax=compute_heatmap_vmax(display_field, grid, color_percentile),
         )
         add_land_layer(ax, land_union, bbox, visualization, zorder=3)
         plot_throughput_contours(
             ax,
-            visualization_field,
+            display_field,
             grid,
-            contour_levels,
+            display_transform.transform_levels(contour_levels),
+            display_transform=display_transform,
             contour_color=visualization.throughput_contour_color,
             contour_linewidth=visualization.throughput_contour_linewidth,
         )
@@ -1442,14 +1580,18 @@ def render_throughput_map(
             projection=projection,
             visualization=visualization,
         )
+        add_operational_translation_legend(ax, display_transform, visualization)
 
         colorbar = fig.colorbar(heatmap, ax=ax, pad=0.02, shrink=0.86)
-        colorbar.set_label("Throughput Capacity (tons/day)", fontsize=11)
-        colorbar.ax.yaxis.set_major_formatter(FuncFormatter(lambda value, _position: f"{value:,.0f}"))
+        colorbar.set_label(display_transform.colorbar_label, fontsize=11)
+        colorbar.ax.yaxis.set_major_formatter(
+            FuncFormatter(lambda value, _position: display_transform.format_value(value))
+        )
         colorbar.ax.tick_params(labelsize=9, colors=visualization.tick_color)
         colorbar.outline.set_edgecolor(visualization.spine_color)
         colorbar.outline.set_linewidth(0.8)
 
+        footer_note = display_transform.footer_note
         fig.text(
             0.013,
             0.012,
@@ -1460,6 +1602,7 @@ def render_throughput_map(
                 f"Color cap = P{color_percentile:.0f} | "
                 f"Sigma = {heatmap_sigma:.1f} | "
                 "Vessel contribution cutoff at half of listed range"
+                + (f" | {footer_note}" if footer_note else "")
             ),
             fontsize=8.5,
             color="#4a5568",
@@ -1903,6 +2046,7 @@ def generate_outputs(config: ScenarioConfig) -> tuple[list[Path], list[RoutedHub
                 title=output.title,
                 subtitle=subtitle,
                 projection=config.map.projection,
+                operational_legend=output.operational_legend,
                 visualization=config.visualization,
                 show_hubs=output.show_hubs,
             )
